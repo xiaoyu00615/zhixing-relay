@@ -343,3 +343,22 @@ Vitest
 - 默认不会自动批准 WorkBuddy 工具权限。
 - Chrome 扩展必须绑定一个明确的 ChatGPT 标签页。
 - 正式自动转发默认只认 `[ZHIXING_RELAY] TYPE: TASK`。
+
+
+
+## Milestone
+
+### v0.1.0-workbuddy-cdp
+
+Completed:
+
+- WorkBuddy Electron CDP connection
+- Slate Editor input injection
+- WorkBuddy send automation
+- Task running state detection
+- Completion detection
+
+Known issues:
+
+- Chrome Extension Bridge reconnect
+- ChatGPT browser injection
