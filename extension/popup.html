@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Zhixing Relay Bridge</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main>
+    <h1>Zhixing Relay Bridge</h1>
+
+    <div class="status-row">
+      <span>Relay</span>
+      <strong id="relayStatus">检查中...</strong>
+    </div>
+
+    <div class="status-row">
+      <span>绑定对话</span>
+      <strong id="tabStatus">未绑定</strong>
+    </div>
+
+    <button id="pinTab" class="wide">使用当前 ChatGPT 标签页</button>
+
+    <label class="switch-row">
+      <span>启用桥接</span>
+      <input id="enabled" type="checkbox" />
+    </label>
+
+    <label>
+      <span>Relay 地址</span>
+      <input id="relayUrl" type="text" spellcheck="false" />
+    </label>
+
+    <label>
+      <span>共享密钥（可选）</span>
+      <input id="relaySharedSecret" type="password" spellcheck="false" />
+    </label>
+
+    <label class="switch-row">
+      <span>扩展默认自动发送</span>
+      <input id="autoSendToChatGPT" type="checkbox" />
+    </label>
+
+    <p class="hint">
+      必须先在你要使用的知行 ChatGPT 对话页点击“使用当前 ChatGPT 标签页”。
+      Relay 只会监听和操作这一页。
+    </p>
+
+    <div class="actions">
+      <button id="save">保存</button>
+      <button id="reconnect" class="secondary">重新连接</button>
+    </div>
+
+    <p id="message" class="message"></p>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

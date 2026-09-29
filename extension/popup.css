@@ -1,0 +1,28 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+body { margin: 0; min-width: 360px; background: Canvas; color: CanvasText; }
+main { padding: 16px; }
+h1 { margin: 0 0 16px; font-size: 17px; }
+label, .status-row, .switch-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin: 12px 0;
+}
+label:not(.switch-row) { align-items: flex-start; flex-direction: column; }
+input[type="text"], input[type="password"] {
+  box-sizing: border-box; width: 100%; padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
+  border-radius: 8px; background: Canvas; color: CanvasText;
+}
+.hint { margin: 12px 0; font-size: 12px; line-height: 1.45; opacity: .72; }
+.actions { display: flex; gap: 8px; }
+button {
+  flex: 1; padding: 8px 10px; border: 0; border-radius: 8px;
+  cursor: pointer; background: AccentColor; color: AccentColorText;
+}
+button.secondary { background: color-mix(in srgb, CanvasText 10%, transparent); color: CanvasText; }
+button.wide { width: 100%; }
+.message { min-height: 18px; margin: 10px 0 0; font-size: 12px; }
+.ok { color: #16803c; }
+.bad { color: #b42318; }
