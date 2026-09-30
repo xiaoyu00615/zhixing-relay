@@ -2,6 +2,7 @@ import { AuditLog } from "./audit.js";
 import { BridgeServer } from "./bridge-server.js";
 import { startCli } from "./cli.js";
 import { loadConfig } from "./config.js";
+import { ModelRouter } from "./model-router/router.js";
 import { ZhixingRelay } from "./relay.js";
 import { RelayStore } from "./store.js";
 import { WorkBuddyClient } from "./workbuddy.js";
@@ -17,12 +18,16 @@ async function main(): Promise<void> {
     config.paths.tokens,
   );
 
+  const router = ModelRouter.create(config.paths.models, config.modelRouter);
+  await router.init();
+
   const relay = new ZhixingRelay(
     config,
     bridge,
     store,
     audit,
     workbuddy,
+    router,
   );
 
   await relay.init();

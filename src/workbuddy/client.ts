@@ -116,6 +116,26 @@ export class WorkBuddyClient {
 
 
 
+  /**
+   * Pass-through to the shared CDP connection.
+   *
+   * Sibling adapters (the model selector) need the same page, and opening a
+   * second debugger session would be wasteful and could race. Nothing here
+   * changes how the existing send / read paths speak to their own endpoints.
+   */
+  evaluate(
+    expression: string
+  ): Promise<unknown> {
+
+    return this.cdp.evaluate(
+      expression
+    );
+
+  }
+
+
+
+
 
   async sendMessage(
     text:string

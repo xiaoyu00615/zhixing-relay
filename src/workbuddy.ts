@@ -1,4 +1,8 @@
 import { WorkBuddyClient as CDPWorkBuddyClient } from "./workbuddy/client.js";
+import {
+  WorkBuddyModelController,
+  type ModelSwitchResult,
+} from "./workbuddy/model.js";
 import type { AppConfig } from "./config.js";
 import type { WorkBuddyMessage } from "./types.js";
 import { waitForTurn } from "./workbuddy/turn-state.js";
@@ -8,6 +12,8 @@ export class WorkBuddyClient {
 
 
   private cdpClient: CDPWorkBuddyClient;
+
+  private modelController: WorkBuddyModelController;
 
 
 
@@ -30,6 +36,11 @@ export class WorkBuddyClient {
     this.cdpClient =
       new CDPWorkBuddyClient(
         config.cdpUrl
+      );
+
+    this.modelController =
+      new WorkBuddyModelController(
+        this.cdpClient
       );
 
   }
@@ -97,6 +108,22 @@ async sendText(
 
 
 
+
+  /**
+   * Model selector control. The relay asks for a label chosen by the model
+   * router; the DOM knowledge needed to apply it stays here.
+   */
+  getCurrentModel(): Promise<string | null> {
+    return this.modelController.getCurrentModel();
+  }
+
+  listAvailableModels(): Promise<string[]> {
+    return this.modelController.listAvailableModels();
+  }
+
+  selectModel(label: string): Promise<ModelSwitchResult> {
+    return this.modelController.selectModel(label);
+  }
 
   async waitForAssistantReply(
     startingMessageId: string,

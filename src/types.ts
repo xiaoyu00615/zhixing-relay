@@ -29,6 +29,13 @@ export type CurrentTask = {
   workbuddyOutboundMessageId?: string;
   startedAt: string;
   status: "sending" | "waiting_workbuddy" | "result_pending" | "sent_to_gpt";
+  /**
+   * Which model routed this turn, recorded so a restarted relay can rebuild
+   * the task's pin from durable state. The router's own pin stays in memory -
+   * this is only the fact needed to recreate it, not the pin itself.
+   */
+  modelId?: string;
+  modelLabel?: string;
 };
 
 export type PersistedState = {

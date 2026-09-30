@@ -6,6 +6,17 @@ import { RelayStore } from "./store.js";
 import type { ExtensionInbound, PendingItem } from "./types.js";
 import { browserFingerprint, isoNow, makeId } from "./utils.js";
 import { WorkBuddyClient } from "./workbuddy.js";
+import type { ModelRouter } from "./model-router/router.js";
+import type { ModelUnavailableReason, ModelSelection } from "./model-router/types.js";
+
+/**
+ * One routed turn: the model the router picked for this task. Kept next to
+ * the task lifecycle so every exit path can release the pin.
+ */
+type RoutedModel = {
+  id: string;
+  label: string;
+};
 
 export class ZhixingRelay {
   private workAbort: AbortController | null = null;
@@ -16,6 +27,11 @@ export class ZhixingRelay {
     private readonly store: RelayStore,
     private readonly audit: AuditLog,
     private readonly workbuddy: WorkBuddyClient,
+    /**
+     * Optional so a relay can still run without routing. When absent every
+     * turn goes to whatever model WorkBuddy already shows.
+     */
+    private readonly router: ModelRouter | null = null,
   ) {}
 
   async init(): Promise<void> {
@@ -91,6 +107,7 @@ export class ZhixingRelay {
       void this.resumeWorkBuddyWait(
         task.taskId,
         task.workbuddyOutboundMessageId,
+        task.modelId,
       );
       return;
     }
@@ -306,26 +323,69 @@ export class ZhixingRelay {
 
     const taskId = ensureTaskId(text, makeId("task"));
 
-    await this.store.mutate((state) => {
-      state.state = "WAIT_WORKBUDDY";
-      state.currentTask = {
-        taskId,
-        sourceFingerprint,
-        sourceText: text,
-        startedAt: isoNow(),
-        status: "sending",
-      };
-    });
+    /*
+     * Routing happens BEFORE WorkBuddy receives anything. Once  the task text
+     * is typed into the composer there is no clean way back, so this is the
+     * last moment at which "no usable model" can still mean "don't start".
+     */
+    let routed: RoutedModel | null = null;
 
-    await this.audit.write("workbuddy_send_start", {
-      taskId,
-      textLength: text.length,
-    });
+    if (this.router) {
+      let selection: ModelSelection;
+
+      try {
+        selection = this.router.selectModel();
+      } catch (error) {
+        // A router that cannot even answer is not a reason to drop the task.
+        await this.holdTaskForModelRecovery(taskId, text, sourceFingerprint, {
+          nextResetAt: null,
+          reasons: [],
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+
+      if (selection.kind === "no_available_model") {
+        await this.holdTaskForModelRecovery(taskId, text, sourceFingerprint, {
+          nextResetAt: selection.nextResetAt,
+          reasons: selection.reasons,
+        });
+        return;
+      }
+
+      routed = { id: selection.model.id, label: selection.model.label };
+      this.router.pin(routed.id);
+    }
 
     try {
       const online = await this.workbuddy.online();
       if (!online) {
         throw new Error("WorkBuddy local assistant is offline");
+      }
+
+      await this.store.mutate((state) => {
+        state.state = "WAIT_WORKBUDDY";
+        state.currentTask = {
+          taskId,
+          sourceFingerprint,
+          sourceText: text,
+          startedAt: isoNow(),
+          status: "sending",
+          ...(routed
+            ? { modelId: routed.id, modelLabel: routed.label }
+            : {}),
+        };
+      });
+
+      await this.audit.write("workbuddy_send_start", {
+        taskId,
+        textLength: text.length,
+        ...(routed ? { modelId: routed.id, modelLabel: routed.label } : {}),
+      });
+
+      // Apply the routed model and only then hand over the task text.
+      if (routed) {
+        await this.applyRoutedModel(taskId, routed);
       }
 
       const outboundId = await this.workbuddy.sendText(text);
@@ -383,18 +443,123 @@ export class ZhixingRelay {
         state.currentTask = null;
         state.state = state.paused ? "PAUSED" : "IDLE";
       });
+    } finally {
+      /*
+       * Whatever happened - send failure, CDP drop, a real cancellation or a
+       * completion wait error - the task is over, so its claim on the model
+       * ends here. Releasing in `finally` is what keeps a failed turn from
+       * pinning the router forever.
+       */
+      this.router?.releasePin();
+    }
+  }
+
+  /**
+   * Applies the routed model to the real WorkBuddy UI and waits for the UI to
+   * confirm, before a single character of the task is sent.
+   */
+  private async applyRoutedModel(taskId: string, routed: RoutedModel): Promise<void> {
+    const before = await this.workbuddy.getCurrentModel().catch(() => null);
+
+    if (before === routed.label) {
+      await this.audit.write("model_already_active", {
+        taskId,
+        modelId: routed.id,
+        modelLabel: routed.label,
+      });
+      return;
+    }
+
+    await this.workbuddy.selectModel(routed.label);
+
+    await this.audit.write("model_selected", {
+      taskId,
+      modelId: routed.id,
+      modelLabel: routed.label,
+      previousModel: before,
+    });
+
+    console.log(
+      `[relay] model=${routed.label} selected for task=${taskId}${before ? ` (was ${before})` : ""}`,
+    );
+  }
+
+  /**
+   * No model is usable right now. The task is kept, never sent, and never
+   * silently handed to a blocked model - a future quota watcher can pick it
+   * back up once something recovers.
+   */
+  private async holdTaskForModelRecovery(
+    taskId: string,
+    text: string,
+    sourceFingerprint: string,
+    detail: {
+      nextResetAt: string | null;
+      reasons: ModelUnavailableReason[];
+      error?: string;
+    },
+  ): Promise<void> {
+    await this.store.enqueue({
+      kind: "gpt_task",
+      id: makeId("pending-gpt"),
+      text,
+      fingerprint: sourceFingerprint,
+      createdAt: isoNow(),
+    });
+
+    await this.audit.write("model_no_available", {
+      taskId,
+      nextResetAt: detail.nextResetAt,
+      error: detail.error ?? null,
+      reasons: detail.reasons.map((reason) => ({
+        modelId: reason.modelId,
+        label: reason.label,
+        kind: reason.kind,
+        blockedUntil: reason.blockedUntil,
+        reason: reason.reason,
+      })),
+    });
+
+    console.warn(
+      `[relay] No model available for task=${taskId}; kept in queue, NOT sent to WorkBuddy. ` +
+        `nextResetAt=${detail.nextResetAt ?? "unknown"}${detail.error ? ` (${detail.error})` : ""}`,
+    );
+
+    for (const reason of detail.reasons) {
+      console.warn(
+        `[relay]   unavailable: ${reason.label} (${reason.kind}) until ${reason.blockedUntil ?? "n/a"}${reason.reason ? ` - ${reason.reason}` : ""}`,
+      );
     }
   }
 
   private async resumeWorkBuddyWait(
     taskId: string,
     outboundId: string,
+    modelId?: string,
   ): Promise<void> {
+    /*
+     * The router's pin is memory-only, so it died with the previous process.
+     * currentTask.modelId is what lets this recovered turn claim the same
+     * model again, so another task cannot take over a higher-priority model
+     * while this one is still finishing.
+     */
+    if (this.router && modelId) {
+      try {
+        this.router.pin(modelId);
+      } catch {
+        // The catalog changed under us; fall back to unrestricted selection.
+        console.warn(
+          `[relay] Cannot restore pin to "${modelId}" after restart; continuing without it`,
+        );
+      }
+    }
+
     this.workAbort = new AbortController();
 
     await this.audit.write("workbuddy_wait_resumed", {
       taskId,
       workbuddyMessageId: outboundId,
+      ...(modelId ? { modelId } : {}),
     });
 
     try {
@@ -429,7 +594,14 @@ export class ZhixingRelay {
         error: detail,
       });
       console.error(`[relay] Resumed WorkBuddy wait failed: ${detail}`);
+    } finally {
+      this.router?.releasePin();
     }
+  }
+
+  /** Snapshot for future TUI / operators, without exposing router internals. */
+  modelSnapshot(now?: Date) {
+    return this.router?.getSnapshot(now ?? new Date()) ?? null;
   }
 
   private async onWorkBuddyResult(
