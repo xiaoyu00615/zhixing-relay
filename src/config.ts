@@ -62,6 +62,17 @@ export function loadConfig() {
        * requested model cannot run.
        */
       fallbacks: parseFallbackMap(process.env.MODEL_FALLBACKS),
+      /**
+       * How many times ONE task may be re-dispatched after WorkBuddy reports
+       * a model quota exhaustion. Bounded on purpose: a retry that always
+       * lands on the same exhausted model must not become a loop.
+       */
+      quotaRetries: envInt("MODEL_QUOTA_RETRIES", 2),
+      /**
+       * How long to block a model whose reset time the notice did not give.
+       * Always an absolute instant once stored; this is only the fallback.
+       */
+      quotaBlockMs: envInt("MODEL_QUOTA_BLOCK_MS", 3_600_000),
     },
     paths: {
       state: new URL("../data/state.json", import.meta.url),

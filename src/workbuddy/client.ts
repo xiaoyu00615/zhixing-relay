@@ -1,11 +1,19 @@
 import { CDPClient } from "./cdp.js";
 import {
+  COLLECT_QUOTA_SIGNALS_EXPRESSION,
+  detectQuota,
+  parseQuotaSignalsPayload,
+  type QuotaDetection,
+  type QuotaSignals,
+} from "./quota.js";
+import {
   decideTurnState,
   type WorkBuddyState,
   type WorkBuddyTurnSignals,
 } from "./turn-state.js";
 
 export type { WorkBuddyState } from "./turn-state.js";
+export type { QuotaDetection, QuotaSignals } from "./quota.js";
 
 /*
  * Harvests STRUCTURAL signals for the current WorkBuddy turn only.
@@ -540,6 +548,20 @@ export class WorkBuddyClient {
     };
   }
 
+  /**
+   * Reads the model-credit/quota state of the live page.
+   *
+   * Uses the same shared CDP connection as every other adapter; the whole
+   * probe is one round trip and it never mutates the page.
+   */
+  /** Raw payload of the quota probe; kept for debugging, not used by Relay. */
+  async detectQuotaRaw(): Promise<unknown> {
+    return this.cdp.evaluate(COLLECT_QUOTA_SIGNALS_EXPRESSION);
+  }
 
-
+  async detectQuota(): Promise<QuotaDetection> {
+    const raw = await this.cdp.evaluate(COLLECT_QUOTA_SIGNALS_EXPRESSION);
+    const signals = parseQuotaSignalsPayload(raw);
+    return detectQuota(signals);
+  }
 }

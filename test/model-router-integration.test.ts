@@ -17,6 +17,7 @@ import { RelayStore } from "../src/store.js";
 import type { ExtensionInbound, PendingItem } from "../src/types.js";
 import type { WorkBuddyClient } from "../src/workbuddy.js";
 import { WorkBuddyModelError } from "../src/workbuddy/model.js";
+import { AVAILABLE_DETECTION, type QuotaDetection } from "../src/workbuddy/quota.js";
 
 const IDS = {
   hy4: "hy4-preview",
@@ -27,6 +28,8 @@ const IDS = {
 
 const NOW = new Date("2026-10-01T00:00:00.000Z");
 const BLOCK_2H = new Date(NOW.getTime() + 7_200_000);
+/** The reset instant WorkBuddy prints in its quota notice. */
+const RESET_AT = new Date(NOW.getTime() + 7_200_000).toISOString();
 
 function taskText(taskId: string, model?: string | null): string {
   const headers = [
@@ -60,7 +63,8 @@ type Call = {
     | "workbuddy.getCurrentModel"
     | "workbuddy.selectModel"
     | "workbuddy.sendText"
-    | "workbuddy.wait";
+    | "workbuddy.wait"
+    | "workbuddy.detectQuota";
   label?: string;
 };
 
@@ -90,6 +94,16 @@ type Harness = {
   selectModelError: WorkBuddyModelError | null;
   /** Injected failure for handing the text to WorkBuddy. */
   sendTextError: string | null;
+  /**
+   * Quota verdict injected into the first turn that finishes. Cleared as soon
+   * as it is consumed, so a retry always resolves on the second attempt -
+   * otherwise a "quota exhausted" that never clears could never finish.
+   */
+  quotaExhausted: { modelLabel: string; resetAt: string | null } | null;
+  /** How many times the relay probed WorkBuddy for quota. */
+  quotaProbes: number;
+  /** Makes the quota probe itself throw (CDP failure). */
+  quotaProbeError: string | null;
   /** When set, the wait settles immediately instead of hanging. */
   waitOutcome: WaitOutcome | null;
   /** Makes every router.selectModel() throw, to simulate a broken store. */
@@ -194,6 +208,9 @@ async function makeHarness(
     sendTextError: null,
     waitOutcome: null,
     routerThrow: null,
+    quotaExhausted: null,
+    quotaProbes: 0,
+    quotaProbeError: null,
   } as Harness;
 
   const bridge = {
@@ -253,6 +270,26 @@ async function makeHarness(
           );
       });
     },
+    detectQuota: async (): Promise<QuotaDetection> => {
+      record("workbuddy.detectQuota");
+      h.quotaProbes += 1;
+
+      if (h.quotaProbeError) throw new Error(h.quotaProbeError);
+
+      // One-shot: the first turn reports the limit, later turns are clean.
+      const injected = h.quotaExhausted;
+      h.quotaExhausted = null;
+
+      if (!injected) return { ...AVAILABLE_DETECTION, modelLabel: h.currentModel };
+
+      return {
+        status: "quota_exhausted",
+        modelLabel: injected.modelLabel,
+        resetAt: injected.resetAt,
+        reason: `当前您在${injected.modelLabel}模型的免费使用量已超过频率限制`,
+        source: "turn",
+      };
+    },
   } as unknown as WorkBuddyClient;
 
   const config = {
@@ -260,6 +297,10 @@ async function makeHarness(
       pauseOnManualUserMessage: false,
       gptForwardMode: "tagged",
       autoSendToChatGPT: true,
+    },
+    modelRouter: {
+      quotaRetries: 2,
+      quotaBlockMs: 3_600_000,
     },
   } as unknown as AppConfig;
 
@@ -604,7 +645,12 @@ describe("model router <> relay integration", () => {
     const [a] = h.dispatchIds();
     const aCalls = h.callsFor(a!);
     expect(kindsOf(aCalls)).toContain("workbuddy.wait");
-    expect(kindsOf(aCalls)[aCalls.length - 1]).toBe("workbuddy.wait");
+    // The quota probe runs after the wait, so the turn's last CORE call is
+    // the wait; the dispatch scoping above proves nothing leaked either way.
+    const coreTail = kindsOf(aCalls).filter(
+      (kind) => kind !== "workbuddy.detectQuota",
+    );
+    expect(coreTail[coreTail.length - 1]).toBe("workbuddy.wait");
     expect(h.sentToChatGpt.some((text) => text.includes("a-result"))).toBe(true);
 
     // Task B now starts; its reply is left hanging on purpose.
@@ -732,6 +778,218 @@ describe("model router <> relay integration", () => {
     expect(freshRouter.pinnedModelId()).toBe(IDS.hy3);
   });
 
+  it("posts exactly one RESULT when the recovered wait is clean", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+
+    await h.startTask("t-recovered-clean");
+
+    // A second relay reading the same durable state, after a restart.
+    const freshRouter = new ModelRouter({
+      models: DEFAULT_MODELS,
+      store: new ModelStateStore(
+        pathToFileURL(join(sandboxRoot, `case-${seq}`, "models.json")),
+      ),
+    });
+    await freshRouter.init();
+
+    /** Everything the recovered turn typed into WorkBuddy. */
+    const sent: string[] = [];
+
+    const freshRelay = new ZhixingRelay(
+      {
+        relay: {
+          pauseOnManualUserMessage: false,
+          gptForwardMode: "tagged",
+          autoSendToChatGPT: true,
+        },
+      } as unknown as AppConfig,
+      {
+        hasClient: () => true,
+        onMessage: () => {},
+        // The RESULT the recovered turn forwards has to be observable here.
+        send: async (message: { text: string }) => {
+          h.sentToChatGpt.push(message.text);
+        },
+        close: async () => {},
+      } as unknown as BridgeServer,
+      h.store,
+      fakeAudit(h.auditEvents),
+      {
+        init: async () => {},
+        online: async () => true,
+        getCurrentModel: async () => "Hy4 preview",
+        selectModel: async () => ({
+          changed: false,
+          previous: "Hy4 preview",
+          current: "Hy4 preview",
+        }),
+        sendText: async (text: string) => {
+          sent.push(text);
+          return "wb-1";
+        },
+        // Answers at once, the way an already-finished round would.
+        waitForAssistantReply: async () => ({
+          text: "RESULT BODY",
+          lastMessageId: "wb-1",
+          assistantMessages: [],
+        }),
+        detectQuota: async () => ({ ...AVAILABLE_DETECTION, modelLabel: "Hy4 preview" }),
+      } as unknown as WorkBuddyClient,
+      freshRouter,
+    );
+
+    await freshRelay.init();
+    // resume() releases the recovered wait without awaiting it.
+    await freshRelay.resume();
+    /*
+     * Releasing the pin is the `finally` of the whole recovered turn, so it
+     * only lands once the turn - and every result it forwards - is done.
+     * Sampling the forwarded text any earlier would race against the send.
+     */
+    await flushUntil(() => freshRouter.pinnedModelId() === null);
+
+    // The recovered turn waits for the message that was already sent: typing
+    // the task again would make WorkBuddy answer the request twice.
+    expect(sent).toHaveLength(0);
+
+    // The loop waited for the already-sent message; waiting again here would
+    // deliver the same RESULT to ChatGPT twice.
+    expect(
+      h.sentToChatGpt.filter((text) => text.includes("RESULT BODY")),
+    ).toHaveLength(1);
+  });
+
+  it("re-sends a recovered task on the next model after the answer reports quota", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+
+    await h.startTask("t-recovered-quota");
+
+    const freshRouter = new ModelRouter({
+      models: DEFAULT_MODELS,
+      store: new ModelStateStore(
+        pathToFileURL(join(sandboxRoot, `case-${seq}`, "models.json")),
+      ),
+    });
+    await freshRouter.init();
+
+    /* Waits hang until the test releases them, so the retry can be observed. */
+    const pendingWaits: Array<() => void> = [];
+    /** Everything typed into WorkBuddy by the recovered relay. */
+    const sent: string[] = [];
+    const answer = (): {
+      text: string;
+      lastMessageId: string;
+      assistantMessages: [];
+    } => ({ text: "RESULT BODY", lastMessageId: "wb-2", assistantMessages: [] });
+
+    const freshRelay = new ZhixingRelay(
+      {
+        relay: {
+          pauseOnManualUserMessage: false,
+          gptForwardMode: "tagged",
+          autoSendToChatGPT: true,
+        },
+      } as unknown as AppConfig,
+      {
+        hasClient: () => true,
+        onMessage: () => {},
+        // The RESULT the recovered turn forwards has to be observable here.
+        send: async (message: { text: string }) => {
+          h.sentToChatGpt.push(message.text);
+        },
+        close: async () => {},
+      } as unknown as BridgeServer,
+      h.store,
+      fakeAudit(h.auditEvents),
+      {
+        init: async () => {},
+        online: async () => true,
+        getCurrentModel: async () => "Hy4 preview",
+        selectModel: async (label: string) => {
+          h.currentModel = label;
+          return { changed: true, previous: "Hy4 preview", current: label };
+        },
+        sendText: async (text: string) => {
+          sent.push(text);
+          return "wb-2";
+        },
+        waitForAssistantReply: () =>
+          new Promise((resolve) => {
+            pendingWaits.push(() => resolve(answer()));
+          }),
+        // Exhausted once - exactly like the one-shot probe in the main harness.
+        detectQuota: async (): Promise<QuotaDetection> => {
+          const injected = h.quotaExhausted;
+          h.quotaExhausted = null;
+          return injected
+            ? {
+                status: "quota_exhausted",
+                modelLabel: injected.modelLabel,
+                resetAt: injected.resetAt,
+                reason: "quota exhausted",
+                source: "turn",
+              }
+            : { ...AVAILABLE_DETECTION, modelLabel: h.currentModel };
+        },
+      } as unknown as WorkBuddyClient,
+      freshRouter,
+    );
+
+    await freshRelay.init();
+    // resume() releases the recovered wait fire-and-forget.
+    await freshRelay.resume();
+    await flushUntil(() => pendingWaits.length === 1);
+
+    expect(pendingWaits).toHaveLength(1);
+    expect(h.store.snapshot().currentTask?.modelId).toBe(IDS.hy4);
+    // Waiting only: the recovered turn must not type the task a second time.
+    expect(sent).toHaveLength(0);
+
+    // The recovered answer arrives on the model the task was using.
+    h.quotaExhausted = { modelLabel: "Hy4 preview", resetAt: RESET_AT };
+    pendingWaits[0]?.();
+    await flushUntil(() => pendingWaits.length > 1);
+
+    const blocked = h.auditEvents.find((e) => e.event === "model_quota_blocked");
+    expect(blocked).toMatchObject({
+      event: "model_quota_blocked",
+      payload: { modelId: IDS.hy4, retry: 1 },
+    });
+
+    // The retry re-sends the SAME task text, once, on the next usable model.
+    expect(sent).toEqual([taskText("t-recovered-quota")]);
+
+    // The task went back out, on the next usable model, under its own id.
+    const lastRouted = [...h.auditEvents]
+      .reverse()
+      .find((event) => event.event === "model_routed")?.payload;
+    expect(lastRouted).toMatchObject({
+      modelId: IDS.hy3,
+      retried: true,
+      retry: 1,
+      previousModelId: IDS.hy4,
+    });
+
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-recovered-quota");
+
+    pendingWaits[1]?.();
+    await flushUntil(() =>
+      h.sentToChatGpt.some((text) => text.includes("RESULT BODY")),
+    );
+
+    // One RESULT for the whole recovered turn, never two.
+    expect(
+      h.sentToChatGpt.filter((text) => text.includes("RESULT BODY")),
+    ).toHaveLength(1);
+
+    // The claim on the model ends with the turn, not with the send.
+    await flushUntil(() => freshRouter.pinnedModelId() === null);
+    expect(freshRouter.pinnedModelId()).toBeNull();
+    expect(h.store.snapshot().pending).toHaveLength(0);
+  });
+
   it("runs a task that names its model on that model, never on Hy4", async () => {
     const h = await makeHarness();
     h.currentModel = "Hy4 preview";
@@ -780,6 +1038,169 @@ describe("model router <> relay integration", () => {
       true,
     );
     expect(h.router.pinnedModelId()).toBeNull();
+  });
+
+  it("falls back to Hy3 and re-sends when Hy4 reports quota exhausted", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true, text: "hy4 refuses: quota" };
+    h.quotaExhausted = { modelLabel: "Hy4 preview", resetAt: RESET_AT };
+
+    await h.sendTask("t-quota");
+
+    // The task moved to Hy3 and was really handed over again.
+    expect(appliedLabels(h.calls)).toEqual(["Hy3"]);
+    expect(hasCall(h.calls, "workbuddy.sendText")).toBe(true);
+    expect(h.quotaProbes).toBe(2); // once per attempt
+
+    // Hy4 was blocked with the reset instant the notice carried.
+    const blocked = h.auditEvents.find((e) => e.event === "model_quota_blocked");
+    expect(blocked?.payload).toMatchObject({
+      taskId: "t-quota",
+      modelId: IDS.hy4,
+      blockedUntil: RESET_AT,
+    });
+
+    // The RESULT travelled for the finished task, on the fallback model.
+    expect(h.sentToChatGpt.some((text) => text.includes("hy4 refuses: quota"))).toBe(
+      true,
+    );
+    expect(h.sentToChatGpt.filter((t) => t.includes("TYPE: RESULT"))).toHaveLength(1);
+    expect(h.router.pinnedModelId()).toBeNull();
+  });
+
+  it("keeps the TASK_ID and the task identity across a quota retry", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true, text: "attempt 1" };
+    h.quotaExhausted = { modelLabel: "Hy4 preview", resetAt: RESET_AT };
+
+    await h.sendTask("t-quota-same-id");
+
+    const routedEvents = h.auditEvents.filter(
+      (e) => e.event === "model_routed" && e.payload.retried === true,
+    );
+    expect(routedEvents).toHaveLength(1);
+    expect(
+      h.auditEvents.every((e) =>
+        "taskId" in e.payload ? e.payload.taskId === "t-quota-same-id" : true,
+      ),
+    ).toBe(true);
+
+    // No duplicate task was queued: the task finished on the fallback model.
+    const pending = h.store.snapshot().pending as PendingItem[];
+    expect(pending).toHaveLength(0);
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-quota-same-id");
+  });
+
+  it("pins the fallback model for the retry and releases it at the end", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true, text: "retry body" };
+    h.quotaExhausted = { modelLabel: "Hy4 preview", resetAt: RESET_AT };
+
+    await h.sendTask("t-quota-pin");
+
+    // The first pin is dropped when the model is blocked, the second covers
+    // the retry; nothing is left pinned once the round is over.
+    const pins = h.calls
+      .filter((c) => c.kind === "router.pin" && c.label !== undefined)
+      .map((c) => c.label);
+    expect(pins).toEqual([IDS.hy4, IDS.hy3]);
+    expect(h.router.pinnedModelId()).toBeNull();
+  });
+
+  it("stores the reset time as the moment the model becomes usable again", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true, text: "body" };
+    h.quotaExhausted = { modelLabel: "Hy4 preview", resetAt: RESET_AT };
+
+    await h.sendTask("t-quota-reset");
+
+    // A moment before the reset the model is still held.
+    const justBefore = h.router
+      .getSnapshot(new Date(Date.parse(RESET_AT) - 1000))
+      .models.find((entry) => entry.model.id === IDS.hy4);
+    expect(justBefore?.runtime.blockedUntil).toBe(RESET_AT);
+    expect(justBefore?.unavailableKind).toBe("blocked");
+    expect(justBefore?.available).toBe(false);
+
+    // At the reset instant the block no longer holds.
+    const atReset = h.router
+      .getSnapshot(new Date(RESET_AT))
+      .models.find((entry) => entry.model.id === IDS.hy4);
+    expect(atReset?.available).toBe(true);
+  });
+
+  it("lets the blocked model back in once its reset instant has passed", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true, text: "body" };
+    h.quotaExhausted = { modelLabel: "Hy4 preview", resetAt: RESET_AT };
+
+    await h.sendTask("t-quota-expiry");
+
+    // One second before the reset: still blocked.
+    const before = h.router.selectModel({
+      now: new Date(Date.parse(RESET_AT) - 1000),
+    });
+    expect(before.kind === "selected" && before.model.id).toBe(IDS.hy3);
+
+    // At the reset instant the block no longer holds, so Hy4 wins again.
+    const after = h.router.selectModel({ now: new Date(RESET_AT) });
+    expect(after.kind === "selected" && after.model.id).toBe(IDS.hy4);
+  });
+
+  it("stops the task and keeps it queued when every fallback is exhausted", async () => {
+    const h = await makeHarness();
+    for (const id of [IDS.hy3, IDS.deepseek, IDS.glm]) {
+      await h.router.blockModel(id, BLOCK_2H, "quota exhausted");
+    }
+
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true, text: "quota body" };
+    h.quotaExhausted = { modelLabel: "Hy4 preview", resetAt: RESET_AT };
+
+    await h.sendTask("t-quota-nowhere");
+
+    // Used up to the retry limit and then refused: never sent a second time.
+    expect(hasCall(h.calls, "workbuddy.sendText")).toBe(true);
+    expect(
+      h.calls.filter((c) => c.kind === "workbuddy.wait"),
+    ).toHaveLength(1);
+    expect(h.sentToChatGpt.some((text) => text.includes("TYPE: RESULT"))).toBe(false);
+
+    // The stale currentTask is gone, so the re-queued task is not hidden
+    // behind its own in-flight record.
+    expect(h.store.snapshot().currentTask).toBeNull();
+
+    const queued = h.store.snapshot().pending as PendingItem[];
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.text ?? "").toContain("TASK_ID: t-quota-nowhere");
+
+    const event = h.auditEvents.find((e) => e.event === "model_no_available");
+    expect(event?.payload.nextResetAt).toBe(RESET_AT);
+    expect(h.router.pinnedModelId()).toBeNull();
+  });
+
+  it("does not retry when the quota probe itself fails", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true, text: "probe failed" };
+    h.quotaProbeError = "CDP connection closed";
+
+    await h.sendTask("t-quota-probe-failed");
+
+    // An unreadable page is not a quota: a usable model must not be blocked.
+    expect(h.quotaProbes).toBe(1);
+    expect(
+      h.auditEvents.some((e) => e.event === "workbuddy_quota_probe_failed"),
+    ).toBe(true);
+    expect(h.router.getSnapshot().models.find((m) => m.model.id === IDS.hy4)?.available).toBe(
+      true,
+    );
+    expect(h.sentToChatGpt.some((text) => text.includes("probe failed"))).toBe(true);
   });
 
   it("degrades to priority routing when the named model is unknown", async () => {

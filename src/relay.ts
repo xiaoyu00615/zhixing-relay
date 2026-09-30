@@ -8,9 +8,14 @@ import {
   wrapWorkBuddyResult,
 } from "./protocol.js";
 import { RelayStore } from "./store.js";
-import type { ExtensionInbound, PendingItem } from "./types.js";
+import type { ExtensionInbound, PendingItem, WorkBuddyMessage } from "./types.js";
 import { browserFingerprint, isoNow, makeId } from "./utils.js";
 import { WorkBuddyClient } from "./workbuddy.js";
+import {
+  AVAILABLE_DETECTION,
+  quotaBlockUntil,
+  type QuotaDetection,
+} from "./workbuddy/quota.js";
 import type { ModelRouter } from "./model-router/router.js";
 import type { ModelUnavailableReason, ModelSelection } from "./model-router/types.js";
 
@@ -401,51 +406,13 @@ export class ZhixingRelay {
         throw new Error("WorkBuddy local assistant is offline");
       }
 
-      await this.store.mutate((state) => {
-        state.state = "WAIT_WORKBUDDY";
-        state.currentTask = {
-          taskId,
-          sourceFingerprint,
-          sourceText: text,
-          startedAt: isoNow(),
-          status: "sending",
-          ...(routed
-            ? { modelId: routed.id, modelLabel: routed.label }
-            : {}),
-        };
-      });
-
-      await this.audit.write("workbuddy_send_start", {
+      const outcome = await this.runTurnWithQuotaRecovery({
         taskId,
-        textLength: text.length,
-        ...(routed ? { modelId: routed.id, modelLabel: routed.label } : {}),
-      });
-
-      // Apply the routed model and only then hand over the task text.
-      if (routed) {
-        await this.applyRoutedModel(taskId, routed);
-      }
-
-      const outboundId = await this.workbuddy.sendText(text);
-
-      await this.store.mutate((state) => {
-        if (!state.currentTask || state.currentTask.taskId !== taskId) return;
-        state.currentTask.workbuddyOutboundMessageId = outboundId;
-        state.currentTask.status = "waiting_workbuddy";
-        state.state = "WAIT_WORKBUDDY";
-      });
-
-      await this.audit.write("workbuddy_message_sent", {
-        taskId,
-        workbuddyMessageId: outboundId,
-      });
-
-      console.log(`[relay] GPT -> WorkBuddy task=${taskId} message=${outboundId}`);
-
-      this.workAbort = new AbortController();
-
-      const result = await this.workbuddy.waitForAssistantReply(outboundId, {
-        signal: this.workAbort.signal,
+        text,
+        sourceFingerprint,
+        requestedModelId,
+        routed,
+        signal: this.workAbort?.signal,
         onProgress: async (message) => {
           await this.audit.write("workbuddy_assistant_chunk", {
             taskId,
@@ -455,17 +422,7 @@ export class ZhixingRelay {
         },
       });
 
-      this.workAbort = null;
-
-      if (!result.text) {
-        throw new Error("WorkBuddy returned an empty assistant response");
-      }
-
-      await this.onWorkBuddyResult(
-        taskId,
-        result.lastMessageId,
-        result.text,
-      );
+      await this.onWorkBuddyResult(taskId, outcome.lastMessageId, outcome.body);
     } catch (error) {
       this.workAbort = null;
       const detail = error instanceof Error ? error.message : String(error);
@@ -490,6 +447,185 @@ export class ZhixingRelay {
        */
       this.router?.releasePin();
     }
+  }
+
+  /**
+   * One task turn, as a loop.
+   *
+   * WorkBuddy can answer that the model just used has run out of quota. In
+   * that case this blocks the model until its reset instant, drops its pin,
+   * asks the router for the next usable model and sends the SAME text again
+   * under the SAME taskId - a retry of this task, never a new one. The loop is
+   * bounded, so a model that keeps answering "exhausted" cannot spin.
+   *
+   * Shared by the fresh send path and the post-restart recovery path, because
+   * both can hit a quota and neither may report it as a plain failure.
+   */
+  private async runTurnWithQuotaRecovery(args: {
+    taskId: string;
+    text: string;
+    sourceFingerprint: string;
+    requestedModelId: string | null;
+    routed: RoutedModel | null;
+    signal?: AbortSignal | undefined;
+    onProgress?: ((message: WorkBuddyMessage) => Promise<void>) | undefined;
+    /**
+     * Set when the message is already in WorkBuddy (a turn resumed after a
+     * restart). The first attempt then waits for THAT message instead of
+     * sending the text a second time - resending would duplicate the user's
+     * request. Only a quota retry sends again.
+     */
+    resumeOutboundId?: string | null | undefined;
+  }): Promise<{ lastMessageId: string; body: string }> {
+    const { taskId, text, routed } = args;
+    let current = routed;
+    let attempt = 0;
+    let resumedId = args.resumeOutboundId ?? null;
+
+    while (true) {
+      if (resumedId !== null) {
+        /*
+         * Recovered turn: the message is already queued, so only the wait
+         * runs. Nothing is re-applied - the model of the in-flight turn is
+         * the one already selected.
+         */
+        this.workAbort = new AbortController();
+
+        const recovered = await this.workbuddy.waitForAssistantReply(resumedId, {
+          signal: args.signal ?? this.workAbort.signal,
+          ...(args.onProgress ? { onProgress: args.onProgress } : {}),
+        });
+
+        this.workAbort = null;
+        resumedId = null;
+
+        if (!recovered.text) {
+          throw new Error("WorkBuddy returned an empty assistant response");
+        }
+
+        const previous = current;
+        const quota = previous
+          ? await this.detectQuotaForTask(taskId, previous)
+          : AVAILABLE_DETECTION;
+
+        if (
+          quota.status === "quota_exhausted" &&
+          attempt < this.quotaRetryLimit()
+        ) {
+          attempt += 1;
+
+          const next = previous
+            ? await this.recoverFromQuota({
+                taskId,
+                text,
+                sourceFingerprint: args.sourceFingerprint,
+                requestedModelId: args.requestedModelId,
+                routed: previous,
+                quota,
+                attempt,
+              })
+            : null;
+
+          if (!next) break;
+          current = next;
+          continue;
+        }
+
+        return { lastMessageId: recovered.lastMessageId, body: recovered.text };
+      }
+
+      // Normal send: apply the routed model BEFORE the text can be typed.
+      await this.store.mutate((state) => {
+        state.state = "WAIT_WORKBUDDY";
+        state.currentTask = {
+          taskId,
+          sourceFingerprint: args.sourceFingerprint,
+          sourceText: text,
+          startedAt: state.currentTask?.startedAt ?? isoNow(),
+          status: "sending",
+          ...(current ? { modelId: current.id, modelLabel: current.label } : {}),
+        };
+      });
+
+      await this.audit.write("workbuddy_send_start", {
+        taskId,
+        textLength: text.length,
+        ...(current ? { modelId: current.id, modelLabel: current.label } : {}),
+      });
+
+      // Apply the routed model and only then hand over the task text.
+      if (current) {
+        await this.applyRoutedModel(taskId, current);
+      }
+
+      const outboundId = await this.workbuddy.sendText(text);
+
+      await this.store.mutate((state) => {
+        if (!state.currentTask || state.currentTask.taskId !== taskId) return;
+        state.currentTask.workbuddyOutboundMessageId = outboundId;
+        state.currentTask.status = "waiting_workbuddy";
+        state.state = "WAIT_WORKBUDDY";
+      });
+
+      await this.audit.write("workbuddy_message_sent", {
+        taskId,
+        workbuddyMessageId: outboundId,
+      });
+
+      console.log(`[relay] GPT -> WorkBuddy task=${taskId} message=${outboundId}`);
+
+      this.workAbort = new AbortController();
+
+      const result = await this.workbuddy.waitForAssistantReply(outboundId, {
+        signal: args.signal ?? this.workAbort.signal,
+        ...(args.onProgress ? { onProgress: args.onProgress } : {}),
+      });
+
+      this.workAbort = null;
+
+      if (!result.text) {
+        throw new Error("WorkBuddy returned an empty assistant response");
+      }
+
+      /*
+       * Quota gate. Only a routed model can be exhausted in a way we know
+       * about, and only while retries remain: enough attempts to cross a real
+       * fallback chain, never enough to re-send forever.
+       */
+      const previous = current;
+      const quota = previous
+        ? await this.detectQuotaForTask(taskId, previous)
+        : AVAILABLE_DETECTION;
+
+      if (
+        quota.status === "quota_exhausted" &&
+        attempt < this.quotaRetryLimit()
+      ) {
+        attempt += 1;
+
+        const next = previous
+          ? await this.recoverFromQuota({
+              taskId,
+              text,
+              sourceFingerprint: args.sourceFingerprint,
+              requestedModelId: args.requestedModelId,
+              routed: previous,
+              quota,
+              attempt,
+            })
+          : null;
+
+        // No usable fallback left: the task stays queued, nothing re-sent.
+        if (!next) break;
+        current = next;
+        continue;
+      }
+
+      return { lastMessageId: result.lastMessageId, body: result.text };
+    }
+
+    // Only reachable when the fallback chain ran out; nothing was sent.
+    throw new Error(`WorkBuddy turn for ${taskId} ended without a usable model`);
   }
 
   /**
@@ -520,6 +656,179 @@ export class ZhixingRelay {
     console.log(
       `[relay] model=${routed.label} selected for task=${taskId}${before ? ` (was ${before})` : ""}`,
     );
+  }
+
+  /**
+   * Reads WorkBuddy's quota state for the model that just ran.
+   *
+   * A failure to probe is never a quota: an unreadable page must not send a
+   * perfectly good task down a retry path (and must not block a usable model).
+   */
+  private async detectQuotaForTask(
+    taskId: string,
+    routed: RoutedModel,
+  ): Promise<QuotaDetection> {
+    try {
+      const detection = await this.workbuddy.detectQuota();
+
+      await this.audit.write("workbuddy_quota_probe", {
+        taskId,
+        routedModelId: routed.id,
+        status: detection.status,
+        detectedModelLabel: detection.modelLabel,
+        resetAt: detection.resetAt,
+        source: detection.source,
+        reason: detection.reason,
+      });
+
+      return detection;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      await this.audit.write("workbuddy_quota_probe_failed", {
+        taskId,
+        routedModelId: routed.id,
+        error: detail,
+      });
+      console.warn(
+        `[relay] quota probe failed for task=${taskId} model=${routed.label}: ${detail}`,
+      );
+      return { ...AVAILABLE_DETECTION, modelLabel: routed.label };
+    }
+  }
+
+  /**
+   * One quota recovery step: block the exhausted model, drop its pin, and let
+   * the router pick the next usable one for the same task.
+   *
+   * Returns the new routed model, or null when nothing is usable - in which
+   * case the caller must stop without sending again and the task goes back to
+   * the pending queue.
+   */
+  private async recoverFromQuota(args: {
+    taskId: string;
+    text: string;
+    sourceFingerprint: string;
+    requestedModelId: string | null;
+    routed: RoutedModel;
+    quota: QuotaDetection;
+    attempt: number;
+  }): Promise<RoutedModel | null> {
+    const { taskId, routed, quota, attempt } = args;
+
+    const blockedUntil = quotaBlockUntil(
+      new Date(),
+      quota.resetAt,
+      this.quotaBlockMs(),
+    ).toISOString();
+
+    /*
+     * The already-ran turn is over: this task is not "still running" on the
+     * exhausted model any more, so the pin is dropped before the next
+     * selection. Releasing after the block, never before, is what keeps the
+     * in-flight turn on its model while the block is being written.
+     */
+    await this.router?.blockModel(
+      routed.id,
+      blockedUntil,
+      `quota exhausted: ${quota.reason ?? routed.label}`,
+    );
+    this.router?.releasePin();
+
+    await this.audit.write("model_quota_blocked", {
+      taskId,
+      modelId: routed.id,
+      modelLabel: routed.label,
+      blockedUntil,
+      detectedModelLabel: quota.modelLabel,
+      reason: quota.reason,
+      retry: attempt,
+    });
+
+    console.warn(
+      `[relay] ${routed.label} is quota exhausted for task=${taskId}; blocked until ${blockedUntil}`,
+    );
+
+    if (!this.router) return null;
+
+    /*
+     * This attempt is finished and the task is going back to the queue, so the
+     * store must stop reserving it - otherwise "another task is active" would
+     * hide the re-queued task behind its own stale currentTask.
+     */
+    const dropCurrent = async (): Promise<void> => {
+      await this.store.mutate((state) => {
+        if (state.currentTask?.taskId !== taskId) return;
+        state.currentTask = null;
+        state.state = state.paused ? "PAUSED" : "IDLE";
+      });
+    };
+
+    let selection: ModelSelection;
+
+    try {
+      selection = this.router.selectModel({
+        requestedModelId: args.requestedModelId,
+        now: new Date(),
+      });
+    } catch (error) {
+      await dropCurrent();
+      await this.holdTaskForModelRecovery(taskId, args.text, args.sourceFingerprint, {
+        nextResetAt: blockedUntil,
+        reasons: [],
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+
+    if (selection.kind === "no_available_model") {
+      await dropCurrent();
+      await this.holdTaskForModelRecovery(taskId, args.text, args.sourceFingerprint, {
+        nextResetAt: selection.nextResetAt,
+        reasons: selection.reasons,
+      });
+      return null;
+    }
+
+    const next: RoutedModel = {
+      id: selection.model.id,
+      label: selection.model.label,
+    };
+
+    this.router.pin(next.id);
+
+    await this.audit.write("model_routed", {
+      taskId,
+      requestedModelId: args.requestedModelId,
+      modelId: selection.model.id,
+      modelLabel: selection.model.label,
+      source: selection.source,
+      fellBack: selection.fellBack,
+      retried: true,
+      retry: attempt,
+      previousModelId: routed.id,
+    });
+
+    console.log(
+      `[relay] retry ${attempt} for task=${taskId}: ${routed.label} exhausted -> ${selection.model.label}`,
+    );
+
+    return next;
+  }
+
+  /** Bounded, so an always-exhausted model cannot spin the turn. */
+  private quotaRetryLimit(): number {
+    const configured = this.config.modelRouter?.quotaRetries;
+    return typeof configured === "number" && configured >= 0
+      ? configured
+      : 2;
+  }
+
+  /** Fallback block length when the notice carries no reset time. */
+  private quotaBlockMs(): number {
+    const configured = this.config.modelRouter?.quotaBlockMs;
+    return typeof configured === "number" && configured > 0
+      ? configured
+      : 3_600_000;
   }
 
   /**
@@ -601,28 +910,85 @@ export class ZhixingRelay {
     });
 
     try {
-      const result = await this.workbuddy.waitForAssistantReply(outboundId, {
-        signal: this.workAbort.signal,
-        onProgress: async (message) => {
-          await this.audit.write("workbuddy_assistant_chunk", {
-            taskId,
-            messageId: message.message_id,
-            msgType: message.msg_type,
-          });
-        },
-      });
+      /*
+       * A recovered turn can hit a quota exactly like a fresh one, so it goes
+       * through the same retry loop. The router's memory-only pin died with
+       * the previous process, so the routed model is rebuilt from what the
+       * durable record still says the task was using.
+       */
+      let routed: RoutedModel | null = null;
+      let text = "";
+      let sourceFingerprint = "";
 
-      this.workAbort = null;
-
-      if (!result.text) {
-        throw new Error("WorkBuddy returned an empty assistant response");
+      if (this.router && modelId) {
+        const entry = this.router
+          .getSnapshot()
+          .models.find((item) => item.model.id === modelId);
+        if (entry) routed = { id: entry.model.id, label: entry.model.label };
       }
 
-      await this.onWorkBuddyResult(
-        taskId,
-        result.lastMessageId,
-        result.text,
-      );
+      const current = this.store.snapshot().currentTask;
+      if (current?.sourceText) text = current.sourceText;
+      if (current?.sourceFingerprint) sourceFingerprint = current.sourceFingerprint;
+
+      const progress = async (message: WorkBuddyMessage): Promise<void> => {
+        await this.audit.write("workbuddy_assistant_chunk", {
+          taskId,
+          messageId: message.message_id,
+          msgType: message.msg_type,
+        });
+      };
+
+      const outcome =
+        routed && text
+          ? await this.runTurnWithQuotaRecovery({
+              taskId,
+              text,
+              sourceFingerprint,
+              requestedModelId: parseRelayEnvelope(text)?.model ?? null,
+              routed,
+              /*
+               * The message is already in WorkBuddy. Waiting for it instead of
+               * sending it again is the whole point of this path: without
+               * this stamp the recovered turn would type the task a second
+               * time and WorkBuddy would answer it twice.
+               */
+              resumeOutboundId: outboundId,
+              signal: this.workAbort?.signal,
+              onProgress: progress,
+            })
+          : null;
+
+      if (outcome) {
+        /*
+         * The loop already waited for this message - or, after a quota retry,
+         * sent the text again and waited for that - so `outcome` IS the turn
+         * result. Posting it here and waiting once more would send the same
+         * answer to ChatGPT twice.
+         */
+        await this.onWorkBuddyResult(taskId, outcome.lastMessageId, outcome.body);
+      } else {
+        /*
+         * Nothing durable to re-route from: the plain wait keeps working
+         * exactly as it always did, and its result is the only one posted.
+         */
+        const result = await this.workbuddy.waitForAssistantReply(outboundId, {
+          signal: this.workAbort?.signal,
+          onProgress: progress,
+        });
+
+        this.workAbort = null;
+
+        if (!result.text) {
+          throw new Error("WorkBuddy returned an empty assistant response");
+        }
+
+        await this.onWorkBuddyResult(
+          taskId,
+          result.lastMessageId,
+          result.text,
+        );
+      }
     } catch (error) {
       this.workAbort = null;
 

@@ -1,4 +1,5 @@
 import { WorkBuddyClient as CDPWorkBuddyClient } from "./workbuddy/client.js";
+import type { QuotaDetection } from "./workbuddy/quota.js";
 import {
   WorkBuddyModelController,
   type ModelSwitchResult,
@@ -123,6 +124,17 @@ async sendText(
 
   selectModel(label: string): Promise<ModelSwitchResult> {
     return this.modelController.selectModel(label);
+  }
+
+  /**
+   * Quota/usage state of the model WorkBuddy is currently on.
+   *
+   * Runs on the shared CDP connection after a turn so the relay can block an
+   * exhausted model and let the router fall back, instead of reporting a
+   * generic "unknown error" to GPT.
+   */
+  detectQuota(): Promise<QuotaDetection> {
+    return this.cdpClient.detectQuota();
   }
 
   async waitForAssistantReply(
