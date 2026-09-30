@@ -1,11 +1,11 @@
 import {
     WorkBuddyClient
-} from "./client";
+} from "./client.js";
 
 
 import {
     WorkBuddyReader
-} from "./reader";
+} from "./reader.js";
 
 
 

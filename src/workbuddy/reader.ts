@@ -1,6 +1,6 @@
 import {
     CDPClient
-} from "./cdp";
+} from "./cdp.js";
 
 
 
