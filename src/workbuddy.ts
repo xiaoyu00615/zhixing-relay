@@ -1,7 +1,7 @@
 import { WorkBuddyClient as CDPWorkBuddyClient } from "./workbuddy/client.js";
 import type { AppConfig } from "./config.js";
 import type { WorkBuddyMessage } from "./types.js";
-import { sleep } from "./utils.js";
+import { waitForTurn } from "./workbuddy/turn-state.js";
 
 
 export class WorkBuddyClient {
@@ -99,248 +99,35 @@ async sendText(
 
 
   async waitForAssistantReply(
-    startingMessageId:string,
-    options?:{
-      onProgress?:
-      (
-        message:WorkBuddyMessage
-      )=>Promise<void>|void;
-
-      signal?:AbortSignal;
-    }
-
-  ):Promise<{
-
-    text:string;
-
-    lastMessageId:string;
-
-    assistantMessages:
-    WorkBuddyMessage[];
-
-  }>{
-
-
-
-    const startedAt =
-Date.now();
-
-
-const before =
-await this.cdpClient.readState();
-
-
-const oldText =
-before.text;
-
-
-console.log(
- "[WB BEFORE]",
- {
-   oldText,
-   length: oldText.length
- }
-);
-
-
-let previousText="";
-
-    let stableCount = 0;
-
-
-
-    console.log(
-      "[WB] waiting reply:",
-      startingMessageId
+    startingMessageId: string,
+    options?: {
+      onProgress?: (message: WorkBuddyMessage) => Promise<void> | void;
+      signal?: AbortSignal;
+    },
+  ): Promise<{
+    text: string;
+    lastMessageId: string;
+    assistantMessages: WorkBuddyMessage[];
+  }> {
+    /*
+     * Completion, cancellation and body extraction now live in
+     * workbuddy/turn-state.ts, decided from STRUCTURAL DOM signals rather
+     * than from keyword search over the whole turn text.
+     */
+    const { text } = await waitForTurn(
+      () => this.cdpClient.readState(),
+      {
+        pollIntervalMs: this.config.pollIntervalMs,
+        maxWaitMs: this.config.maxWaitMs,
+        ...(options?.signal ? { signal: options.signal } : {}),
+      },
     );
 
-
-
-
-
-    while(
-      Date.now()
-      -
-      startedAt
-      <
-      this.config.maxWaitMs
-    ){
-
-
-
-      if(
-        options?.signal?.aborted
-      ){
-
-        throw new Error(
-          "WorkBuddy wait aborted"
-        );
-
-      }
-
-
-
-
-
-
-      const state =
-        await this.cdpClient.readState();
-
-
-
-      console.log(
-        "[WB STATE]",
-        {
-          running:
-            state.running,
-
-          completed:
-            state.completed,
-
-          cancelled:
-            state.cancelled,
-
-          length:
-            state.text.length
-        }
-      );
-
-
-
-
-
-
-      if(
-        state.cancelled
-      ){
-
-        throw new Error(
-          "WorkBuddy task cancelled"
-        );
-
-      }
-
-
-
-
-
-
-      /*
-        还在执行：
-
-        继续等待
-
-        即使10分钟没有文字
-        也不会结束
-      */
-
-      if(
-        state.running
-      ){
-
-        await sleep(
-          this.config.pollIntervalMs
-        );
-
-        continue;
-
-      }
-
-
-
-
-
-
-
-
-      /*
-        已完成：
-
-        等待文本稳定两轮
-
-        防止最后一句还在刷新
-      */
-
-      if(
- state.completed
- &&
- state.text
- &&
- state.text !== oldText
-){
-
-
-
-        if(
-          state.text === previousText
-        ){
-
-          stableCount++;
-
-        }
-        else{
-
-          previousText =
-            state.text;
-
-          stableCount = 0;
-
-        }
-
-
-
-
-
-
-        if(
-          stableCount >= 2
-        ){
-
-
-          console.log(
-            "[WB] final result confirmed"
-          );
-
-
-
-          return {
-
-            text:
-              state.text,
-
-            lastMessageId:
-              startingMessageId,
-
-            assistantMessages:[]
-
-          };
-
-        }
-
-
-      }
-
-
-
-
-
-
-      await sleep(
-        this.config.pollIntervalMs
-      );
-
-
-    }
-
-
-
-
-
-    throw new Error(
-      `Timed out waiting WorkBuddy after ${this.config.maxWaitMs}ms`
-    );
-
-
+    return {
+      text,
+      lastMessageId: startingMessageId,
+      assistantMessages: [],
+    };
   }
 
 
