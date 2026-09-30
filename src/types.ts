@@ -12,6 +12,10 @@ export type PendingItem =
       text: string;
       fingerprint: string;
       createdAt: string;
+      /** Present when this queue entry is a failing turn's second attempt. */
+      taskId?: string;
+      retryCount?: number;
+      reason?: string;
     }
   | {
       kind: "workbuddy_result";
@@ -29,6 +33,12 @@ export type CurrentTask = {
   workbuddyOutboundMessageId?: string;
   startedAt: string;
   status: "sending" | "waiting_workbuddy" | "result_pending" | "sent_to_gpt";
+  /**
+   * When the RESULT was handed to ChatGPT. This is the start of the WAIT_GPT
+   * lease: it is what lets a restarted relay tell "waiting for an
+   * acknowledgement" from "nothing was ever sent".
+   */
+  sentToGptAt?: string;
   /**
    * Which model routed this turn, recorded so a restarted relay can rebuild
    * the task's pin from durable state. The router's own pin stays in memory -

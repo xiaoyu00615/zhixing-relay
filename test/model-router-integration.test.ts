@@ -108,6 +108,8 @@ type Harness = {
   waitOutcome: WaitOutcome | null;
   /** Makes every router.selectModel() throw, to simulate a broken store. */
   routerThrow: Error | null;
+  /** False makes the relay hold its RESULT instead of forwarding it. */
+  bridgeConnected: boolean;
   /** Runs a full turn to completion, optionally naming a model in the task. */
   sendTask: (taskId: string, model?: string | null) => Promise<void>;
   /** Returns once THIS turn reaches WorkBuddy but before the reply arrives. */
@@ -120,6 +122,10 @@ type Harness = {
   callsFor: (id: number) => Call[];
   /** How many wait resolvers `id` still owns. */
   waitHooksFor: (id: number) => number;
+  /** Pushes an inbound bridge message of any shape straight to the relay. */
+  raw: (message: unknown) => Promise<void>;
+  /** Pushes a ChatGPT user message (a human paste, or the RESULT returning). */
+  userMessage: (text: string, fingerprint?: string) => Promise<void>;
 };
 
 let sandboxRoot = "";
@@ -152,7 +158,7 @@ function fakeAudit(sink: { event: string; payload: Record<string, unknown> }[]):
 
 async function makeHarness(
   models: readonly ModelDefinition[] = DEFAULT_MODELS,
-  options: { blockAll?: boolean } = {},
+  options: { blockAll?: boolean; resultLeaseMs?: number } = {},
 ): Promise<Harness> {
   seq += 1;
   const dir = join(sandboxRoot, `case-${seq}`);
@@ -181,6 +187,8 @@ async function makeHarness(
   /** The dispatch currently in flight, or 0 while nothing is dispatching. */
   let activeDispatchId = 0;
   let nextDispatchId = 0;
+  /** Keeps every dispatched message a distinct fingerprint for the relay. */
+  let fingerprintSeq = 0;
   let messageHandler: ((message: ExtensionInbound) => Promise<void>) | null = null;
 
   /**
@@ -208,13 +216,14 @@ async function makeHarness(
     sendTextError: null,
     waitOutcome: null,
     routerThrow: null,
+    bridgeConnected: true,
     quotaExhausted: null,
     quotaProbes: 0,
     quotaProbeError: null,
   } as Harness;
 
   const bridge = {
-    hasClient: () => true,
+    hasClient: () => h.bridgeConnected,
     onMessage: (handler: (message: ExtensionInbound) => Promise<void>) => {
       messageHandler = handler;
     },
@@ -297,6 +306,9 @@ async function makeHarness(
       pauseOnManualUserMessage: false,
       gptForwardMode: "tagged",
       autoSendToChatGPT: true,
+      ...(options.resultLeaseMs === undefined
+        ? {}
+        : { resultLeaseMs: options.resultLeaseMs }),
     },
     modelRouter: {
       quotaRetries: 2,
@@ -330,6 +342,9 @@ async function makeHarness(
 
   const relay = new ZhixingRelay(config, bridge, store, fakeAudit(auditEvents), workbuddy, traced);
 
+  // Registers the bridge handler, so tests can push any inbound message.
+  await relay.init();
+
   h.relay = relay;
   h.router = router;
 
@@ -338,10 +353,15 @@ async function makeHarness(
     model?: string | null,
   ): Promise<void> => {
     if (!messageHandler) throw new Error("bridge handler was never registered");
+    /*
+     * Unique per dispatch: the relay drops a message whose fingerprint it has
+     * seen, so dispatching the same task twice (a retry) needs a fresh one.
+     */
+    fingerprintSeq += 1;
     return messageHandler({
       type: "chatgpt_assistant_message",
       text: taskText(taskId, model),
-      fingerprint: `fp-${taskId}`,
+      fingerprint: `fp-${taskId}-${fingerprintSeq}`,
     });
   };
 
@@ -414,6 +434,17 @@ async function makeHarness(
   h.callsFor = (id: number) => records.find((r) => r.id === id)?.calls ?? [];
   h.waitHooksFor = (id: number) =>
     records.find((r) => r.id === id)?.waitHooks.length ?? 0;
+
+  /** Feeds an inbound message of any shape, including ones the union omits. */
+  h.raw = async (message: unknown): Promise<void> => {
+    if (!messageHandler) throw new Error("bridge handler was never registered");
+    await messageHandler(message as ExtensionInbound);
+  };
+
+  /** Feeds the ChatGPT thread as a human/user message. */
+  h.userMessage = async (text: string, fingerprint = "fp-manual"): Promise<void> => {
+    await h.raw({ type: "chatgpt_user_message", text, fingerprint });
+  };
 
   return h;
 }
@@ -1090,7 +1121,16 @@ describe("model router <> relay integration", () => {
     // No duplicate task was queued: the task finished on the fallback model.
     const pending = h.store.snapshot().pending as PendingItem[];
     expect(pending).toHaveLength(0);
-    expect(h.store.snapshot().currentTask?.taskId).toBe("t-quota-same-id");
+
+    /*
+     * The round is closed the moment its RESULT reaches ChatGPT, even after a
+     * retry, so the identity of the task is carried by the forwarded text and
+     * the audit trail - not by a task record nobody is waiting for any more.
+     */
+    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(h.store.snapshot().state).toBe("IDLE");
+    const forwarded = h.sentToChatGpt.find((text) => text.includes("attempt 1"));
+    expect(forwarded).toContain("TASK_ID: t-quota-same-id");
   });
 
   it("pins the fallback model for the retry and releases it at the end", async () => {
@@ -1201,6 +1241,240 @@ describe("model router <> relay integration", () => {
       true,
     );
     expect(h.sentToChatGpt.some((text) => text.includes("probe failed"))).toBe(true);
+  });
+
+  it("releases the task the moment the RESULT reaches ChatGPT", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true, text: "gate passed" };
+
+    // An answer waiting behind the round that is about to finish.
+    await h.store.enqueue({
+      kind: "workbuddy_result",
+      id: "pending-wb-early",
+      taskId: "t-earlier",
+      text: "queued answer",
+      workbuddyMessageId: "wb-earlier",
+      createdAt: new Date().toISOString(),
+    });
+
+    await h.sendTask("t-release");
+
+    // The RESULT went out exactly once.
+    expect(h.sentToChatGpt.filter((text) => text.includes("gate passed"))).toHaveLength(1);
+
+    // ...and with it the task record nobody is waiting for any more.
+    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(h.store.snapshot().state).toBe("IDLE");
+    expect(
+      h.auditEvents.some(
+        (e) =>
+          e.event === "round_completed" &&
+          e.payload.taskId === "t-release" &&
+          e.payload.reason === "result_delivered",
+      ),
+    ).toBe(true);
+
+    // A released round is an idle relay, so the queue moved on.
+    expect(h.store.snapshot().pending).toHaveLength(0);
+    expect(h.sentToChatGpt.some((text) => text.includes("queued answer"))).toBe(true);
+  });
+
+  it("holds the RESULT when the bridge is down, then releases it on lease expiry", async () => {
+    const h = await makeHarness(DEFAULT_MODELS, { resultLeaseMs: 20 });
+    h.waitOutcome = { ok: true, text: "held answer" };
+
+    // Nothing can confirm the delivery, so the lease has to.
+    h.bridgeConnected = false;
+    await h.sendTask("t-lease");
+
+    await flushUntil(() =>
+      h.auditEvents.some((e) => e.event === "result_lease_expired"),
+    );
+
+    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(
+      h.auditEvents.some(
+        (e) =>
+          e.event === "round_completed" &&
+          e.payload.reason === "result_lease_expired",
+      ),
+    ).toBe(true);
+
+    /*
+     * The lease released the record, not the work. The release wakes the
+     * queue, which puts the RESULT back where it waits for the bridge.
+     */
+    await flushUntil(() =>
+      (h.store.snapshot().pending as PendingItem[]).some((item) =>
+        (item.text ?? "").includes("held answer"),
+      ),
+    );
+
+    const queued = h.store.snapshot().pending as PendingItem[];
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.text).toContain("held answer");
+    expect(h.sentToChatGpt).toHaveLength(0);
+  });
+
+  it("releases a stale WAIT_GPT record as soon as traffic arrives", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true, text: "stale answer" };
+
+    // The shape a restart reads: a RESULT delivered long ago, still holding.
+    await h.store.mutate((state) => {
+      const sentAt = new Date(Date.now() - 600_000).toISOString();
+      state.currentTask = {
+        taskId: "t-stale",
+        sourceFingerprint: "fp-stale",
+        sourceText: "Run the gate.",
+        startedAt: sentAt,
+        status: "sent_to_gpt",
+        sentToGptAt: sentAt,
+      };
+      state.state = "WAIT_GPT";
+    });
+
+    await h.raw({ type: "chatgpt_page_ready", title: "stale page" });
+
+    expect(h.auditEvents.some((e) => e.event === "result_lease_expired")).toBe(true);
+    expect(h.store.snapshot().currentTask).toBeNull();
+  });
+
+  it("never lets the queue start work while a task record exists", async () => {
+    const h = await makeHarness();
+
+    await h.store.enqueue({
+      kind: "gpt_task",
+      id: "p-blocked",
+      text: taskText("t-blocked"),
+      fingerprint: "fp-blocked",
+      createdAt: new Date().toISOString(),
+    });
+
+    // A round that delivered its RESULT but still holds its record.
+    await h.store.mutate((state) => {
+      state.currentTask = {
+        taskId: "t-holding",
+        sourceFingerprint: "fp-holding",
+        sourceText: "Run the gate.",
+        startedAt: new Date().toISOString(),
+        status: "sent_to_gpt",
+        sentToGptAt: new Date().toISOString(),
+      };
+      state.state = "WAIT_GPT";
+    });
+
+    await h.relay.resume();
+
+    expect(
+      (h.store.snapshot().pending as PendingItem[]).map((item) => item.id),
+    ).toEqual(["p-blocked"]);
+    expect(h.calls.some((call) => call.kind === "workbuddy.sendText")).toBe(false);
+
+    // A round whose answer WorkBuddy is still producing is blocked for the
+    // same reason, so the queue stays untouched there too.
+    await h.store.mutate((state) => {
+      state.currentTask = {
+        taskId: "t-working",
+        sourceFingerprint: "fp-working",
+        sourceText: "Run the gate.",
+        startedAt: new Date().toISOString(),
+        status: "waiting_workbuddy",
+      };
+      state.state = "WAIT_WORKBUDDY";
+    });
+
+    await h.relay.resume();
+
+    expect(
+      (h.store.snapshot().pending as PendingItem[]).map((item) => item.id),
+    ).toEqual(["p-blocked"]);
+    expect(h.calls.some((call) => call.kind === "workbuddy.sendText")).toBe(false);
+  });
+
+  it("puts a cancelled task back in the queue instead of losing it", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: false, error: "WorkBuddy task cancelled" };
+
+    await h.sendTask("t-cancelled");
+
+    const queued = h.store.snapshot().pending as PendingItem[];
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      kind: "gpt_task",
+      taskId: "t-cancelled",
+      retryCount: 1,
+      reason: "WorkBuddy task cancelled",
+    });
+    expect(queued[0]?.text ?? "").toContain("TASK_ID: t-cancelled");
+
+    expect(h.sentToChatGpt.some((text) => text.includes("TYPE: RESULT"))).toBe(false);
+    expect(h.auditEvents.some((e) => e.event === "task_requeued")).toBe(true);
+    expect(h.router.pinnedModelId()).toBeNull();
+  });
+
+  it("stops requeuing a task WorkBuddy always refuses", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: false, error: "WorkBuddy task cancelled" };
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await h.sendTask("t-persistent");
+    }
+
+    const queued = h.store.snapshot().pending as PendingItem[];
+    // Three requeues were allowed; the fourth attempt was refused.
+    expect(queued).toHaveLength(3);
+    expect(queued[2]).toMatchObject({ taskId: "t-persistent", retryCount: 3 });
+    expect(
+      h.auditEvents.filter((e) => e.event === "task_requeued"),
+    ).toHaveLength(3);
+    expect(h.auditEvents.some((e) => e.event === "task_retry_exhausted")).toBe(true);
+    expect(h.sentToChatGpt.some((text) => text.includes("TYPE: RESULT"))).toBe(false);
+  });
+
+  it("treats a RESULT pasted into ChatGPT as the completion signal", async () => {
+    const h = await makeHarness();
+
+    await h.startTask("t-pasted");
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-pasted");
+
+    // A RESULT belonging to another round must not close this one.
+    await h.userMessage(
+      [
+        "[ZHIXING_RELAY]",
+        "TYPE: RESULT",
+        "TASK_ID: t-other",
+        "SOURCE: GPT",
+        "",
+        "not this task",
+      ].join("\n"),
+    );
+
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-pasted");
+
+    await h.userMessage(
+      [
+        "[ZHIXING_RELAY]",
+        "TYPE: RESULT",
+        "TASK_ID: t-pasted",
+        "SOURCE: GPT",
+        "",
+        "done by hand",
+      ].join("\n"),
+    );
+
+    expect(h.auditEvents.some((e) => e.event === "result_observed_in_chatgpt")).toBe(
+      true,
+    );
+    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(h.store.snapshot().state).toBe("IDLE");
+
+    // The paste is Relay's own output arriving, not a new request: it neither
+    // forwarded a RESULT nor handed the task to WorkBuddy a second time.
+    expect(h.sentToChatGpt).toHaveLength(0);
+    expect(
+      h.calls.filter((call) => call.kind === "workbuddy.sendText"),
+    ).toHaveLength(1);
   });
 
   it("degrades to priority routing when the named model is unknown", async () => {

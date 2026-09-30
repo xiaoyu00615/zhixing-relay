@@ -28,8 +28,27 @@ type RoutedModel = {
   label: string;
 };
 
+/**
+ * Thrown when a turn stops on purpose: the fallback chain ran out and the
+ * task was already handed back to the queue. It is not a failure of the send,
+ * so it must not be requeued a second time.
+ */
+class NoUsableModelError extends Error {}
+
+/**
+ * The WAIT_GPT lease. One round at a time owns it; the timer is what frees a
+ * delivered RESULT that nobody ever acknowledges.
+ */
+type ResultLease = {
+  taskId: string;
+  timer: ReturnType<typeof setTimeout>;
+};
+
 export class ZhixingRelay {
   private workAbort: AbortController | null = null;
+  private resultLease: ResultLease | null = null;
+  /** Attempts already spent on one taskId, so a retry has a number. */
+  private taskAttempts = new Map<string, number>();
 
   constructor(
     private readonly config: AppConfig,
@@ -128,6 +147,7 @@ export class ZhixingRelay {
   async stopCurrentRound(reason = "manual"): Promise<void> {
     this.workAbort?.abort();
     this.workAbort = null;
+    this.clearResultLease();
 
     const snapshot = this.store.snapshot();
 
@@ -182,6 +202,10 @@ export class ZhixingRelay {
   }
 
   private async onExtensionMessage(message: ExtensionInbound): Promise<void> {
+    // An incoming message is a chance to release a lease that a restart left
+    // behind, even when the timer is not running any more.
+    await this.checkResultLease();
+
     switch (message.type) {
       case "bridge_hello":
         await this.audit.write("bridge_connected", {
@@ -211,9 +235,22 @@ export class ZhixingRelay {
         });
 
         if (message.ok) {
+          /*
+           * The extension confirms the RESULT reached ChatGPT's composer.
+           * Releasing here closes the round as soon as the delivery is real
+           * instead of waiting for the lease; the record is already gone when
+           * only the lease could confirm it.
+           */
           const snapshot = this.store.snapshot();
           if (snapshot.currentTask?.status === "sent_to_gpt") {
-            await this.store.setState("WAIT_GPT");
+            const released = await this.completeCurrentRound(
+              snapshot.currentTask.taskId,
+              "gpt_send_confirmed",
+            );
+
+            if (released) {
+              await this.flushOnePending();
+            }
           }
         }
         return;
@@ -229,6 +266,44 @@ export class ZhixingRelay {
   }
 
   private async onChatGPTUserMessage(message: Extract<ExtensionInbound, { type: "chatgpt_user_message" }>): Promise<void> {
+    const envelope = parseRelayEnvelope(message.text);
+
+    /*
+     * A RESULT envelope seen in the ChatGPT thread is a completion signal:
+     * either Relay's own delivery coming back to the page, or a human
+     * pasting the RESULT by hand. Both mean the round is over.
+     */
+    if (envelope?.type === "RESULT") {
+      await this.store.markSeen(message.fingerprint);
+
+      const current = this.store.snapshot().currentTask;
+      const taskId = envelope.taskId ?? current?.taskId ?? null;
+
+      await this.audit.write("result_observed_in_chatgpt", {
+        taskId: taskId ?? null,
+        taskIdHeader: envelope.taskId,
+        injected: await this.store.consumeExpectedInjectedUser(message.fingerprint),
+      });
+
+      /*
+       * A RESULT that names a different task belongs to an earlier round: it
+       * must not close the round that is currently running.
+       */
+      if (taskId && (envelope.taskId === null || envelope.taskId === current?.taskId)) {
+        const released = await this.completeCurrentRound(taskId, "manual_result");
+        if (released) {
+          await this.flushOnePending();
+        }
+      }
+
+      /*
+       * Whatever the RESULT was, it is Relay's own output arriving as a user
+       * message now, so it must never be mistaken for human chatter and pause
+       * the relay.
+       */
+      return;
+    }
+
     if (this.store.hasSeen(message.fingerprint)) return;
     await this.store.markSeen(message.fingerprint);
 
@@ -427,12 +502,35 @@ export class ZhixingRelay {
       this.workAbort = null;
       const detail = error instanceof Error ? error.message : String(error);
 
-      await this.audit.write("workbuddy_turn_failed", {
-        taskId,
-        error: detail,
-      });
+      /*
+       * The chain already ran out: the task is in the queue with its
+       * model_no_available record, so requeuing here would duplicate it.
+       */
+      const noUsableModel = error instanceof NoUsableModelError;
 
-      console.error(`[relay] WorkBuddy turn failed: ${detail}`);
+      if (noUsableModel) {
+        await this.audit.write("workbuddy_turn_abandoned", {
+          taskId,
+          error: detail,
+        });
+      } else {
+        await this.audit.write("workbuddy_turn_failed", {
+          taskId,
+          error: detail,
+        });
+
+        console.error(`[relay] WorkBuddy turn failed: ${detail}`);
+
+        // A cancelled or failed turn is not a lost task: it goes back to the
+        // queue carrying the reason, and the pin is released below.
+        await this.requeueTask({
+          taskId,
+          text,
+          sourceFingerprint,
+          reason: detail,
+          detail,
+        });
+      }
 
       await this.store.mutate((state) => {
         state.currentTask = null;
@@ -625,7 +723,9 @@ export class ZhixingRelay {
     }
 
     // Only reachable when the fallback chain ran out; nothing was sent.
-    throw new Error(`WorkBuddy turn for ${taskId} ended without a usable model`);
+    throw new NoUsableModelError(
+      `WorkBuddy turn for ${taskId} ended without a usable model`,
+    );
   }
 
   /**
@@ -852,6 +952,8 @@ export class ZhixingRelay {
       text,
       fingerprint: sourceFingerprint,
       createdAt: isoNow(),
+      taskId,
+      reason: "no_available_model",
     });
 
     await this.audit.write("model_no_available", {
@@ -1025,6 +1127,13 @@ export class ZhixingRelay {
       length: wrapped.length,
     });
 
+    /*
+     * The RESULT exists from this moment on, so the lease is armed now and
+     * cleared by whichever path actually commits it. A send that never lands
+     * must still not hold the task hostage.
+     */
+    this.armResultLease(taskId);
+
     const snapshot = this.store.snapshot();
 
     if (snapshot.paused || !this.bridge.hasClient()) {
@@ -1053,6 +1162,173 @@ export class ZhixingRelay {
     }
   }
 
+  /**
+   * Ends a round whose RESULT is on its way to ChatGPT.
+   *
+   * Delivering the result does not wait for an acknowledgement: the next
+   * task must not queue up behind a round that has already given its answer.
+   * Returns false when the task was already gone, so callers can stay
+   * idempotent.
+   */
+  private async completeCurrentRound(taskId: string, reason: string): Promise<boolean> {
+    if (this.resultLease?.taskId === taskId) {
+      this.clearResultLease();
+    }
+
+    const snapshot = this.store.snapshot();
+    const task = snapshot.currentTask;
+
+    if (!task || task.taskId !== taskId) return false;
+
+    await this.store.mutate((state) => {
+      if (state.currentTask?.taskId !== taskId) return;
+
+      state.currentTask = null;
+
+      if (state.state === "WAIT_GPT" || state.state === "WAIT_WORKBUDDY") {
+        state.state = state.paused ? "PAUSED" : "IDLE";
+      }
+    });
+
+    await this.audit.write("round_completed", {
+      taskId,
+      releasedAt: isoNow(),
+      reason,
+    });
+
+    console.log(`[relay] round ${taskId} completed (${reason})`);
+
+    return true;
+  }
+
+  /** RESULT_LEASE_MS, the longest a delivered-but-unacknowledged round may hold a task. */
+  private resultLeaseMs(): number {
+    const configured = this.config.relay?.resultLeaseMs;
+    return typeof configured === "number" && configured > 0 ? configured : 120_000;
+  }
+
+  private armResultLease(taskId: string): void {
+    this.clearResultLease();
+
+    const timer = setTimeout(() => {
+      void this.expireResultLease(taskId);
+    }, this.resultLeaseMs());
+
+    // A lease must never be the reason the process stays alive.
+    timer.unref?.();
+
+    this.resultLease = { taskId, timer };
+  }
+
+  private clearResultLease(): void {
+    if (!this.resultLease) return;
+
+    clearTimeout(this.resultLease.timer);
+    this.resultLease = null;
+  }
+
+  /**
+   * The lease ran out: the RESULT left the building and nobody confirmed it,
+   * so the task record is released rather than kept forever.
+   *
+   * This drops bookkeeping only. The RESULT has either been delivered or sits
+   * in the queue; neither is re-sent here.
+   */
+  private async expireResultLease(taskId: string): Promise<void> {
+    const released = await this.completeCurrentRound(taskId, "result_lease_expired");
+
+    if (!released) return;
+
+    await this.audit.write("result_lease_expired", {
+      taskId,
+      leaseMs: this.resultLeaseMs(),
+    });
+
+    console.warn(
+      `[relay] RESULT for ${taskId} was never acknowledged; released after ${this.resultLeaseMs()}ms`,
+    );
+
+    await this.flushOnePending();
+  }
+
+  /**
+   * Releasing a stale WAIT_GPT task that a restart left behind, so it is also
+   * caught when traffic arrives instead of only when the timer fires.
+   */
+  private async checkResultLease(): Promise<void> {
+    const task = this.store.snapshot().currentTask;
+
+    /*
+     * Either the RESULT was forwarded and is still unacknowledged, or it is
+     * queued and waiting for the bridge to come back. Both are held by the
+     * same lease.
+     */
+    if (!task) return;
+    if (task.status !== "sent_to_gpt" && task.status !== "result_pending") return;
+    if (!task.sentToGptAt) return;
+    if (this.resultLease?.taskId === task.taskId) return;
+    if (Date.now() - Date.parse(task.sentToGptAt) < this.resultLeaseMs()) return;
+
+    await this.expireResultLease(task.taskId);
+  }
+
+  /**
+   * A turn that WorkBuddy refused must not simply vanish: the task goes back
+   * to the queue with the reason attached, so it can be seen and retried.
+   */
+  private async requeueTask(args: {
+    taskId: string;
+    text: string;
+    sourceFingerprint: string;
+    reason: string;
+    detail: string;
+  }): Promise<void> {
+    const previous = this.taskAttempts.get(args.taskId) ?? 0;
+    const retryCount = previous + 1;
+
+    this.taskAttempts.set(args.taskId, retryCount);
+
+    if (retryCount > this.maxTaskRetries()) {
+      await this.audit.write("task_retry_exhausted", {
+        taskId: args.taskId,
+        attempts: retryCount - 1,
+        reason: args.reason,
+      });
+      console.error(
+        `[relay] task ${args.taskId} dropped after ${retryCount - 1} retries (${args.reason})`,
+      );
+      return;
+    }
+
+    await this.store.enqueue({
+      kind: "gpt_task",
+      id: makeId("pending-retry"),
+      text: args.text,
+      fingerprint: args.sourceFingerprint,
+      createdAt: isoNow(),
+      taskId: args.taskId,
+      retryCount,
+      reason: args.reason,
+    });
+
+    await this.audit.write("task_requeued", {
+      taskId: args.taskId,
+      retryCount,
+      reason: args.reason,
+      error: args.detail,
+    });
+
+    console.warn(
+      `[relay] task ${args.taskId} requeued (attempt ${retryCount}) after ${args.reason}`,
+    );
+  }
+
+  /** RELAY_MAX_TASK_RETRIES, so a task WorkBuddy always refuses cannot cycle for ever. */
+  private maxTaskRetries(): number {
+    const configured = this.config.relay?.maxTaskRetries;
+    return typeof configured === "number" && configured >= 0 ? configured : 3;
+  }
+
   private async queueWorkBuddyResult(
     taskId: string,
     workbuddyMessageId: string,
@@ -1062,6 +1338,7 @@ export class ZhixingRelay {
     await this.store.mutate((state) => {
       if (state.currentTask?.taskId === taskId) {
         state.currentTask.status = "result_pending";
+        state.currentTask.sentToGptAt = isoNow();
       }
     });
 
@@ -1099,12 +1376,12 @@ export class ZhixingRelay {
       autoSend: this.config.relay.autoSendToChatGPT,
     });
 
-    await this.store.mutate((state) => {
-      if (state.currentTask?.taskId === taskId) {
-        state.currentTask.status = "sent_to_gpt";
-      }
-      state.state = "WAIT_GPT";
-    });
+    /*
+     * Deliberately no store mutation here. Only the completion owns the
+     * task record: touching the state from the send would let a RESULT that
+     * arrived late - or a queued one belonging to an earlier task - park the
+     * relay in WAIT_GPT again.
+     */
 
     await this.audit.write("workbuddy_result_sent_to_gpt", {
       taskId,
@@ -1114,6 +1391,17 @@ export class ZhixingRelay {
     });
 
     console.log(`[relay] WorkBuddy -> GPT task=${taskId}`);
+
+    /*
+     * The answer is with ChatGPT now. Keeping the task record would park the
+     * relay in WAIT_GPT until the next task happened to arrive, so the round
+     * is closed here and the queue gets a chance to move on.
+     */
+    const released = await this.completeCurrentRound(taskId, "result_delivered");
+
+    if (released) {
+      await this.flushOnePending();
+    }
   }
 
   private async expectInjectedText(text: string): Promise<void> {
@@ -1123,9 +1411,15 @@ export class ZhixingRelay {
 
   private async flushOnePending(): Promise<void> {
     const snapshot = this.store.snapshot();
-    if (snapshot.paused || snapshot.currentTask?.status === "waiting_workbuddy") {
-      return;
-    }
+
+    /*
+     * A task record exists for exactly one reason: that round is not over.
+     * Starting another one would silently overwrite it, so nothing is
+     * dispatched until the relay is truly idle.
+     */
+    if (snapshot.currentTask) return;
+    if (snapshot.state !== "IDLE") return;
+    if (snapshot.paused) return;
 
     const item = await this.store.shiftPending();
     if (!item) return;

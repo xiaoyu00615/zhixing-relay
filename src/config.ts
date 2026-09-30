@@ -35,6 +35,19 @@ export function loadConfig() {
       pauseOnManualUserMessage: envBool("PAUSE_ON_MANUAL_USER_MESSAGE", true),
       autoSendToChatGPT: envBool("AUTO_SEND_TO_CHATGPT", true),
       gptForwardMode: forwardMode as "tagged" | "all",
+      /**
+       * How long a round that has already forwarded its RESULT to ChatGPT may
+       * keep the task record before Relay gives up on an acknowledgement and
+       * frees the task for the next one. The RESULT is never sent again: this
+       * only releases the bookkeeping.
+       */
+      resultLeaseMs: envInt("RESULT_LEASE_MS", 120_000),
+      /**
+       * How often one task may be handed back to the pending queue after a
+       * WorkBuddy failure or cancellation. Bounded so a task WorkBuddy always
+       * refuses cannot cycle for ever.
+       */
+      maxTaskRetries: envInt("RELAY_MAX_TASK_RETRIES", 3),
     },
     workbuddy: {
       baseUrl: process.env.WORKBUDDY_BASE_URL || "https://www.workbuddy.cn",
