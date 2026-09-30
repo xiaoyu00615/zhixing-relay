@@ -9,12 +9,24 @@ build/
 # env
 .env
 .env.*
+!.env.example
 
 # runtime
 *.log
 data/
 state/
 *.json
+
+# Re-include essential project/toolchain configuration that the broad
+# "*.json" runtime rule above would otherwise swallow:
+#   package.json            -> dependencies + typecheck/test/check scripts
+#   tsconfig.json           -> compiler options and include set
+#   extension/manifest.json -> Chrome MV3 manifest
+# These are anchored to their exact paths, so no other *.json file is
+# re-included (runtime state such as data/*.json stays ignored).
+!/package.json
+!/tsconfig.json
+!/extension/manifest.json
 
 # temp
 tmp/

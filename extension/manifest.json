@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Zhixing Relay Bridge",
+  "version": "0.2.0",
+  "description": "Bridge one pinned ChatGPT conversation to the local Zhixing Relay.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Zhixing Relay Bridge",
+    "default_popup": "popup.html"
+  }
+}
