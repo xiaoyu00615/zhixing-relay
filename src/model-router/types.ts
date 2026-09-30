@@ -33,12 +33,29 @@ export type ModelUnavailableReason = {
   reason: string | null;
 };
 
+/**
+ * How a selection was reached. Exposed on every `selected` result so an
+ * operator reading the audit trail can tell a requested model apart from a
+ * fallback, and a fallback apart from an ordinary priority pick.
+ */
+export type ModelSelectionSource =
+  | "pin"
+  | "requested"
+  | "preference"
+  | "priority";
+
 export type ModelSelection =
   | {
       kind: "selected";
       model: ModelDefinition;
       /** true when the result came from the shared pin, not from priority. */
       pinned: boolean;
+      /** The model id/label the task asked for, or null if it asked for none. */
+      requestedModelId: string | null;
+      /** Where the choice came from. Never "pin" unless `pinned` is true. */
+      source: ModelSelectionSource;
+      /** True when the requested model could not be used and something else ran. */
+      fellBack: boolean;
     }
   | {
       kind: "no_available_model";
@@ -46,6 +63,23 @@ export type ModelSelection =
       /** Earliest block expiry among selectable models, or null if none. */
       nextResetAt: string | null;
     };
+
+/**
+ * A routing request for one task.
+ *
+ * Deliberately a plain bag of optional fields: the relay passes what the task
+ * asked for, and the pure rules decide what that means.
+ */
+export type ModelSelectionRequest = {
+  /** The task's own constraint, from its `MODEL:` header. id or UI label. */
+  requestedModelId?: string | null;
+  /** Reserved seam for the future user-preference layer. */
+  userPreferenceId?: string | null;
+  /** Per-model fallback chains; absent means "the catalog order is the chain". */
+  fallbacks?: Readonly<Record<string, readonly string[]>>;
+  /** Injected clock so nothing here ever waits. */
+  now?: Date;
+};
 
 export type ModelAvailability = {
   model: ModelDefinition;

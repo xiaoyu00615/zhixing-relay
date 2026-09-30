@@ -1,7 +1,12 @@
 import type { AppConfig } from "./config.js";
 import { AuditLog } from "./audit.js";
 import { BridgeServer } from "./bridge-server.js";
-import { ensureTaskId, shouldForwardAssistantMessage, wrapWorkBuddyResult } from "./protocol.js";
+import {
+  ensureTaskId,
+  parseRelayEnvelope,
+  shouldForwardAssistantMessage,
+  wrapWorkBuddyResult,
+} from "./protocol.js";
 import { RelayStore } from "./store.js";
 import type { ExtensionInbound, PendingItem } from "./types.js";
 import { browserFingerprint, isoNow, makeId } from "./utils.js";
@@ -324,6 +329,14 @@ export class ZhixingRelay {
     const taskId = ensureTaskId(text, makeId("task"));
 
     /*
+     * A task may name the model that has to run it. Kept as the raw header
+     * value here: whether it names something real is the router's call, and an
+     * unknown name must degrade to normal routing rather than throw at the
+     * GPT boundary.
+     */
+    const requestedModelId = parseRelayEnvelope(text)?.model ?? null;
+
+    /*
      * Routing happens BEFORE WorkBuddy receives anything. Once  the task text
      * is typed into the composer there is no clean way back, so this is the
      * last moment at which "no usable model" can still mean "don't start".
@@ -334,7 +347,10 @@ export class ZhixingRelay {
       let selection: ModelSelection;
 
       try {
-        selection = this.router.selectModel();
+        selection = this.router.selectModel({
+          requestedModelId,
+          now: new Date(),
+        });
       } catch (error) {
         // A router that cannot even answer is not a reason to drop the task.
         await this.holdTaskForModelRecovery(taskId, text, sourceFingerprint, {
@@ -355,6 +371,28 @@ export class ZhixingRelay {
 
       routed = { id: selection.model.id, label: selection.model.label };
       this.router.pin(routed.id);
+
+      await this.audit.write("model_routed", {
+        taskId,
+        requestedModelId,
+        modelId: selection.model.id,
+        modelLabel: selection.model.label,
+        source: selection.source,
+        fellBack: selection.fellBack,
+      });
+
+      if (selection.fellBack) {
+        console.log(
+          `[relay] requested ${selection.requestedModelId} could not run; routed task ${taskId} to ${selection.model.label}`,
+        );
+      } else if (
+        requestedModelId !== null &&
+        selection.requestedModelId === null
+      ) {
+        console.log(
+          `[relay] requested model ${requestedModelId} is not in the catalog; routing ${taskId} by priority`,
+        );
+      }
     }
 
     try {

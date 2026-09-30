@@ -1,13 +1,16 @@
 export {
   DEFAULT_MODELS,
+  parseFallbackMap,
   resolveModels,
   type ModelConfigOverrides,
 } from "./config.js";
 export {
   EMPTY_RUNTIME_STATE,
   evaluateAvailability,
+  fallbackOrder,
   isBlocked,
   nextResetAt,
+  resolveModelId,
   selectModel,
   toEpochMs,
   toIsoString,
@@ -22,6 +25,8 @@ export type {
   ModelRouterSnapshot,
   ModelRuntimeState,
   ModelSelection,
+  ModelSelectionRequest,
+  ModelSelectionSource,
   ModelUnavailableKind,
   ModelUnavailableReason,
   PersistedModelState,

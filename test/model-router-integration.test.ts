@@ -28,15 +28,16 @@ const IDS = {
 const NOW = new Date("2026-10-01T00:00:00.000Z");
 const BLOCK_2H = new Date(NOW.getTime() + 7_200_000);
 
-function taskText(taskId: string): string {
-  return [
+function taskText(taskId: string, model?: string | null): string {
+  const headers = [
     "[ZHIXING_RELAY]",
     "TYPE: TASK",
     `TASK_ID: ${taskId}`,
     "SOURCE: GPT",
-    "",
-    "Run the gate.",
-  ].join("\n");
+  ];
+  if (model) headers.push(`MODEL: ${model}`);
+
+  return [...headers, "", "Run the gate."].join("\n");
 }
 
 /**
@@ -93,10 +94,10 @@ type Harness = {
   waitOutcome: WaitOutcome | null;
   /** Makes every router.selectModel() throw, to simulate a broken store. */
   routerThrow: Error | null;
-  /** Runs a full turn to completion. */
-  sendTask: (taskId: string) => Promise<void>;
+  /** Runs a full turn to completion, optionally naming a model in the task. */
+  sendTask: (taskId: string, model?: string | null) => Promise<void>;
   /** Returns once THIS turn reaches WorkBuddy but before the reply arrives. */
-  startTask: (taskId: string) => Promise<void>;
+  startTask: (taskId: string, model?: string | null) => Promise<void>;
   /** Releases the hanging wait of `id` (default: the most recent dispatch). */
   settle: (id?: number) => Promise<void>;
   /** Identifiers of everything dispatched through this harness, in order. */
@@ -291,11 +292,14 @@ async function makeHarness(
   h.relay = relay;
   h.router = router;
 
-  const dispatchTo = (taskId: string): Promise<void> => {
+  const dispatchTo = (
+    taskId: string,
+    model?: string | null,
+  ): Promise<void> => {
     if (!messageHandler) throw new Error("bridge handler was never registered");
     return messageHandler({
       type: "chatgpt_assistant_message",
-      text: taskText(taskId),
+      text: taskText(taskId, model),
       fingerprint: `fp-${taskId}`,
     });
   };
@@ -309,6 +313,7 @@ async function makeHarness(
   const startDispatch = async (
     taskId: string,
     mode: "barrier" | "complete",
+    model?: string | null,
   ): Promise<void> => {
     const record_: DispatchRecord = {
       id: nextDispatchId++,
@@ -322,7 +327,7 @@ async function makeHarness(
     const restore = (): void => {
       activeDispatchId = 0;
     };
-    const finished = dispatchTo(taskId).then(restore, (error: unknown) => {
+    const finished = dispatchTo(taskId, model).then(restore, (error: unknown) => {
       restore();
       throw error;
     });
@@ -342,14 +347,14 @@ async function makeHarness(
     ]);
   };
 
-  h.sendTask = async (taskId: string) => {
+  h.sendTask = async (taskId: string, model?: string | null) => {
     if (!messageHandler) await relay.init();
-    await startDispatch(taskId, "complete");
+    await startDispatch(taskId, "complete", model);
   };
 
-  h.startTask = async (taskId: string) => {
+  h.startTask = async (taskId: string, model?: string | null) => {
     if (!messageHandler) await relay.init();
-    await startDispatch(taskId, "barrier");
+    await startDispatch(taskId, "barrier", model);
   };
 
   h.settle = async (id?: number) => {
@@ -406,6 +411,24 @@ function hasCall(calls: readonly Call[], kind: Call["kind"], label?: string): bo
 
 function kindsOf(calls: readonly Call[]): string[] {
   return calls.map((call) => call.kind);
+}
+
+/** The labels the UI was actually switched to, in order. */
+function appliedLabels(calls: readonly Call[]): string[] {
+  const labels: string[] = [];
+  for (const call of calls) {
+    if (call.kind === "workbuddy.selectModel" && call.label !== undefined) {
+      labels.push(call.label);
+    }
+  }
+  return labels;
+}
+
+/** The `model_routed` audit record the relay wrote for the turn. */
+function modelRouted(
+  auditEvents: { event: string; payload: Record<string, unknown> }[],
+): Record<string, unknown> | undefined {
+  return auditEvents.find((event) => event.event === "model_routed")?.payload;
 }
 
 describe("model router <> relay integration", () => {
@@ -707,5 +730,77 @@ describe("model router <> relay integration", () => {
     await freshRelay.resume();
 
     expect(freshRouter.pinnedModelId()).toBe(IDS.hy3);
+  });
+
+  it("runs a task that names its model on that model, never on Hy4", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true };
+
+    await h.sendTask("t-named-hy3", IDS.hy3);
+
+    const routed = modelRouted(h.auditEvents);
+    expect(routed).toMatchObject({
+      requestedModelId: IDS.hy3,
+      modelId: IDS.hy3,
+      source: "requested",
+      fellBack: false,
+    });
+
+    // Hy4 preview is first in the catalog and was free, so landing on it here
+    // would mean the request was simply ignored.
+    expect(appliedLabels(h.calls)).toEqual(["Hy3"]);
+
+    expect(h.sentToChatGpt.some((text) => text.includes("RESULT BODY"))).toBe(
+      true,
+    );
+    expect(h.router.pinnedModelId()).toBeNull();
+  });
+
+  it("falls back when the named model cannot run, and still sends", async () => {
+    const h = await makeHarness();
+    await h.router.blockModel(IDS.hy4, BLOCK_2H, "quota exhausted");
+    h.currentModel = "Hy4 preview";
+    h.waitOutcome = { ok: true };
+
+    await h.sendTask("t-named-fallback", IDS.hy4);
+
+    const routed = modelRouted(h.auditEvents);
+    expect(routed).toMatchObject({
+      requestedModelId: IDS.hy4,
+      modelId: IDS.hy3,
+      source: "requested",
+      fellBack: true,
+    });
+
+    // The task text reached WorkBuddy on the fallback model: refusing here
+    // would drop work that a perfectly usable model could take.
+    expect(appliedLabels(h.calls)).toEqual(["Hy3"]);
+    expect(h.calls.some((call) => call.kind === "workbuddy.sendText")).toBe(
+      true,
+    );
+    expect(h.router.pinnedModelId()).toBeNull();
+  });
+
+  it("degrades to priority routing when the named model is unknown", async () => {
+    const h = await makeHarness();
+    h.currentModel = "Hy3";
+    h.waitOutcome = { ok: true };
+
+    await h.sendTask("t-named-unknown", "hy5-preview");
+
+    const routed = modelRouted(h.auditEvents);
+    expect(routed).toMatchObject({
+      requestedModelId: "hy5-preview",
+      modelId: IDS.hy4,
+      source: "priority",
+      fellBack: false,
+    });
+
+    expect(appliedLabels(h.calls)).toEqual(["Hy4 preview"]);
+    expect(h.calls.some((call) => call.kind === "workbuddy.sendText")).toBe(
+      true,
+    );
+    expect(h.router.pinnedModelId()).toBeNull();
   });
 });

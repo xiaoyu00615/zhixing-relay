@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { parseFallbackMap } from "./model-router/config.js";
 
 function envBool(name: string, fallback: boolean): boolean {
   const value = process.env[name];
@@ -56,6 +57,11 @@ export function loadConfig() {
        */
       priority: envList("MODEL_PRIORITY"),
       disabled: envList("MODEL_DISABLED"),
+      /**
+       * Optional "requested:next,next|..." chains used when a task's
+       * requested model cannot run.
+       */
+      fallbacks: parseFallbackMap(process.env.MODEL_FALLBACKS),
     },
     paths: {
       state: new URL("../data/state.json", import.meta.url),

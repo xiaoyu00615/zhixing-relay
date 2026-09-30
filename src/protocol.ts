@@ -4,6 +4,15 @@ export type ParsedRelayTask = {
   taskId: string | null;
   type: string | null;
   source: string | null;
+  /**
+   * The task's own model constraint, e.g. `MODEL: hy3`.
+   *
+   * A null here means the task does not care which model runs it, which is
+   * different from "the task asked for a model that does not exist": the
+   * router keeps both apart so a typo degrades to normal routing instead of
+   * silently choosing a model the GPT side never asked for.
+   */
+  model: string | null;
   raw: string;
 };
 
@@ -20,6 +29,7 @@ export function parseRelayEnvelope(text: string): ParsedRelayTask | null {
     taskId: headerValue(raw, "TASK_ID"),
     type: headerValue(raw, "TYPE")?.toUpperCase() || null,
     source: headerValue(raw, "SOURCE")?.toUpperCase() || null,
+    model: headerValue(raw, "MODEL"),
     raw,
   };
 }

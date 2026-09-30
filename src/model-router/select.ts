@@ -11,6 +11,7 @@ import type {
   ModelDefinition,
   ModelRuntimeState,
   ModelSelection,
+  ModelSelectionSource,
   ModelUnavailableReason,
 } from "./types.js";
 
@@ -117,6 +118,55 @@ export function nextResetAt(
   return earliest === null ? null : new Date(earliest).toISOString();
 }
 
+/**
+ * Resolves what a task asked for against the catalog.
+ *
+ * Ids win over labels: a label is a UI string that can be renamed, an id is
+ * the stable key every persisted block is stored under. Returning null for an
+ * unknown request is deliberate - a typo must not become a selection.
+ */
+export function resolveModelId(
+  models: readonly ModelDefinition[],
+  requested: string | null | undefined,
+): string | null {
+  if (typeof requested !== "string") return null;
+  const needle = requested.trim();
+  if (needle === "") return null;
+
+  const hit =
+    models.find((model) => model.id === needle) ??
+    models.find((model) => model.label === needle);
+
+  return hit ? hit.id : null;
+}
+
+/**
+ * The models to try after `requestedId` proves unusable.
+ *
+ * An explicit chain (from `MODEL_FALLBACKS`) is honoured first, then the
+ * catalog order is appended so an incomplete chain can never leave a model
+ * unreachable. The requested model itself is never offered: by the time this
+ * runs it is known to be unusable, so returning it would be a dead end.
+ */
+export function fallbackOrder(
+  models: readonly ModelDefinition[],
+  requestedId: string,
+  fallbacks?: Readonly<Record<string, readonly string[]>>,
+): string[] {
+  const known = new Set(models.map((model) => model.id));
+  const ordered: string[] = [];
+
+  const push = (id: string): void => {
+    if (id === requestedId) return;
+    if (known.has(id) && !ordered.includes(id)) ordered.push(id);
+  };
+
+  for (const id of fallbacks?.[requestedId] ?? []) push(id);
+  for (const model of models) push(model.id);
+
+  return ordered;
+}
+
 export type SelectModelArgs = {
   models: readonly ModelDefinition[];
   runtime: Record<string, ModelRuntimeState>;
@@ -126,22 +176,109 @@ export type SelectModelArgs = {
    * model recovering mid-task cannot steal the running turn.
    */
   pin?: string | null;
+  /** What the task explicitly asked for; see ModelSelectionRequest. */
+  requestedModelId?: string | null | undefined;
+  /** Reserved seam for the future user-preference layer. */
+  userPreferenceId?: string | null | undefined;
+  /** Per-model fallback chains, keyed by the requested model's id. */
+  fallbacks?: Readonly<Record<string, readonly string[]>> | undefined;
 };
+
+function selected(args: {
+  model: ModelDefinition;
+  source: ModelSelectionSource;
+  requestedModelId: string | null;
+  fellBack: boolean;
+}): ModelSelection {
+  return {
+    kind: "selected",
+    model: { ...args.model },
+    pinned: args.source === "pin",
+    requestedModelId: args.requestedModelId,
+    source: args.source,
+    fellBack: args.fellBack,
+  };
+}
 
 export function selectModel(args: SelectModelArgs): ModelSelection {
   const nowMs = typeof args.now === "number" ? args.now : args.now.getTime();
   const evaluated = evaluateAvailability(args.models, args.runtime, nowMs);
+  const requestedId = resolveModelId(args.models, args.requestedModelId);
 
+  /*
+   * The pin answers first, always.
+   *
+   * It describes the model of the turn already running in WorkBuddy. Honouring
+   * a new task's request over it would mean yanking the model out from under
+   * work in flight, which is the one thing this pin exists to prevent.
+   */
   if (args.pin) {
     const pinned = args.models.find((model) => model.id === args.pin);
     if (pinned) {
-      return { kind: "selected", model: { ...pinned }, pinned: true };
+      return selected({
+        model: pinned,
+        source: "pin",
+        requestedModelId: requestedId,
+        fellBack: false,
+      });
+    }
+  }
+
+  const requested = requestedId
+    ? evaluated.find((entry) => entry.model.id === requestedId)
+    : undefined;
+
+  if (requested?.available) {
+    return selected({
+      model: requested.model,
+      source: "requested",
+      requestedModelId: requestedId,
+      fellBack: false,
+    });
+  }
+
+  /*
+   * The request could not be honoured. A task asking for a model is not the
+   * same as a task that cannot run at all, so this steps down the chain
+   * instead of reporting no_available_model - the text still has to go
+   * somewhere, and the router's job is to find the model that can take it.
+   */
+  if (requestedId) {
+    for (const id of fallbackOrder(args.models, requestedId, args.fallbacks)) {
+      const entry = evaluated.find((candidate) => candidate.model.id === id);
+      if (entry?.available) {
+        return selected({
+          model: entry.model,
+          source: "requested",
+          requestedModelId: requestedId,
+          fellBack: true,
+        });
+      }
+    }
+  }
+
+  // Reserved seam: an operator/user preference outranks plain priority.
+  const preferenceId = resolveModelId(args.models, args.userPreferenceId);
+  if (preferenceId) {
+    const entry = evaluated.find((candidate) => candidate.model.id === preferenceId);
+    if (entry?.available) {
+      return selected({
+        model: entry.model,
+        source: "preference",
+        requestedModelId: requestedId,
+        fellBack: false,
+      });
     }
   }
 
   const first = evaluated.find((entry) => entry.available);
   if (first) {
-    return { kind: "selected", model: { ...first.model }, pinned: false };
+    return selected({
+      model: first.model,
+      source: "priority",
+      requestedModelId: requestedId,
+      fellBack: false,
+    });
   }
 
   return {

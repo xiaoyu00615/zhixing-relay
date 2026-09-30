@@ -24,7 +24,49 @@ export type ModelConfigOverrides = {
   priority?: readonly string[];
   /** ids to force off; unknown ids are ignored. */
   disabled?: readonly string[];
+  /** Per-model fallback chains, keyed by the model id. */
+  fallbacks?: Readonly<Record<string, readonly string[]>>;
 };
+
+/**
+ * Parses `MODEL_FALLBACKS="hy4-preview:hy3|hy3:glm-5.3-flash"`.
+ *
+ * The form is deliberately flat text instead of JSON: this lives in .env next
+ * to MODEL_PRIORITY, and a colon-plus-pipe grammar reads faster than an
+ * escaped array while offering nothing JSON would.
+ *
+ * A chain entry containing ":" is dropped: the grammar has no way to escape
+ * one, so a stray colon means the operator started another pair.
+ */
+export function parseFallbackMap(value: string | null | undefined): Record<
+  string,
+  string[]
+> {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (raw === "") return {};
+
+  const map: Record<string, string[]> = {};
+
+  for (const pair of raw.split("|")) {
+    const trimmed = pair.trim();
+    if (trimmed === "") continue;
+
+    const separator = trimmed.indexOf(":");
+    if (separator <= 0) continue;
+
+    const key = trimmed.slice(0, separator).trim();
+    const chain = trimmed
+      .slice(separator + 1)
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item !== "" && !item.includes(":"));
+
+    if (key === "" || chain.length === 0) continue;
+    map[key] = chain;
+  }
+
+  return map;
+}
 
 /**
  * Applies optional priority/enabled overrides to the catalog.
