@@ -11,6 +11,16 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
 }
 
+function envList(name: string): string[] {
+  const value = process.env[name];
+  if (value == null || value.trim() === "") return [];
+
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item !== "");
+}
+
 export type AppConfig = ReturnType<typeof loadConfig>;
 
 export function loadConfig() {
@@ -39,10 +49,19 @@ export function loadConfig() {
       quietMs: envInt("WORKBUDDY_QUIET_MS", 3500),
       maxWaitMs: envInt("WORKBUDDY_MAX_WAIT_MS", 7_200_000),
     },
+    modelRouter: {
+      /**
+       * Optional comma-separated model ids. Order overrides the catalog order.
+       * Unknown ids are ignored by resolveModels().
+       */
+      priority: envList("MODEL_PRIORITY"),
+      disabled: envList("MODEL_DISABLED"),
+    },
     paths: {
       state: new URL("../data/state.json", import.meta.url),
       tokens: new URL("../data/tokens.json", import.meta.url),
       audit: new URL("../data/audit.jsonl", import.meta.url),
+      models: new URL("../data/models.json", import.meta.url),
     },
   };
 }
