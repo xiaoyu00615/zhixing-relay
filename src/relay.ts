@@ -4,8 +4,9 @@ import { BridgeServer } from "./bridge-server.js";
 import {
   ensureTaskId,
   parseRelayEnvelope,
-  shouldForwardAssistantMessage,
+  readRelayIntent,
   wrapWorkBuddyResult,
+  type RelayIntent,
 } from "./protocol.js";
 import {
   formatDuration,
@@ -573,14 +574,31 @@ export class ZhixingRelay {
       length: message.text.length,
     });
 
-    if (
-      !shouldForwardAssistantMessage(
-        message.text,
-        this.config.relay.gptForwardMode,
-      )
-    ) {
-      console.log("[relay] GPT reply observed, but not marked as a relay TASK");
+    /*
+     * Only a well-formed TASK envelope is work. Whatever the GPT side said
+     * around it - the analysis, the closing remark - is addressed to the human,
+     * and typing it into WorkBuddy would spend a turn on prose. Everything that
+     * is not a TASK also has to stay inert: no pending, no pause, nothing sent.
+     */
+    const intent = readRelayIntent(message.text);
+
+    if (intent.kind !== "task") {
+      await this.noteNonTaskAssistantReply(intent);
       return;
+    }
+
+    const task = intent.task.block ?? message.text;
+
+    if (task !== message.text) {
+      console.log(
+        `[relay] forwarded the [ZHIXING_RELAY] block only: ` +
+          `${message.text.length} chars in, ${task.length} out, ` +
+          `${message.text.length - task.length} chars of prose dropped`,
+      );
+    }
+
+    if (intent.task.legacy) {
+      console.log("[relay] relay task has no [ZHIXING_RELAY_END]; using the legacy envelope");
     }
 
     let snapshot = this.store.snapshot();
@@ -605,7 +623,7 @@ export class ZhixingRelay {
       await this.store.enqueue({
         kind: "gpt_task",
         id: makeId("pending-gpt"),
-        text: message.text,
+        text: task,
         fingerprint: message.fingerprint,
         createdAt: isoNow(),
       });
@@ -617,7 +635,7 @@ export class ZhixingRelay {
       await this.store.enqueue({
         kind: "gpt_task",
         id: makeId("pending-gpt"),
-        text: message.text,
+        text: task,
         fingerprint: message.fingerprint,
         createdAt: isoNow(),
       });
@@ -625,7 +643,46 @@ export class ZhixingRelay {
       return;
     }
 
-    await this.startWorkBuddyTask(message.text, message.fingerprint);
+    await this.startWorkBuddyTask(task, message.fingerprint);
+  }
+
+  /** A machine-readable reason for a reply that carried nothing to do. */
+  private static intentReason(intent: RelayIntent): string {
+    if (intent.kind === "ambiguous") return `ambiguous:${intent.count}_blocks`;
+    if (intent.kind === "ignored") return intent.reason;
+    return intent.kind === "result" ? "type_result" : "type_task";
+  }
+
+  /**
+   * Reports - and records, for later - a ChatGPT reply that is not a TASK.
+   *
+   * The log line is the only observable of this path, so it says which way the
+   * message was ruled out: no envelope at all, an envelope that is not a task,
+   * or a message that cannot be read unambiguously.
+   */
+  private async noteNonTaskAssistantReply(intent: RelayIntent): Promise<void> {
+    await this.audit.write("gpt_reply_not_dispatched", {
+      reason: ZhixingRelay.intentReason(intent),
+    });
+
+    const reason = ZhixingRelay.intentReason(intent);
+
+    if (intent.kind === "ambiguous") {
+      console.log(
+        `[relay] GPT reply ignored: ${intent.count} closed relay blocks in one ` +
+          `message; refusing to guess which one is the task`,
+      );
+      return;
+    }
+
+    if (intent.kind === "ignored" && intent.reason === "no_block") {
+      console.log("[relay] GPT reply observed, but no relay task");
+      return;
+    }
+
+    console.log(
+      `[relay] GPT reply observed, but not marked as a relay TASK (reason=${reason})`,
+    );
   }
 
   private async startWorkBuddyTask(text: string, sourceFingerprint: string): Promise<void> {

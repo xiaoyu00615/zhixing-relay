@@ -144,18 +144,63 @@ Chrome extension: waiting for connection...
 
 Relay 不应该把 GPT 每一句解释都自动交给 WorkBuddy。
 
-只有 GPT 回复中出现：
+只有 GPT 回复中**完整的 Relay TASK block**（`[ZHIXING_RELAY]` 到 `[ZHIXING_RELAY_END]` 之间）才被发送。
 
 ```text
 [ZHIXING_RELAY]
 TYPE: TASK
 TASK_ID: P7-S4R4
 SOURCE: GPT
+MODEL: hy3
 
 这里写真正要交给 WorkBuddy 的任务……
+[ZHIXING_RELAY_END]
 ```
 
 Relay 才发送。
+
+### 5.0 TASK Block Extractor（v0.4.5）
+
+GPT 的回复通常同时讲给人和讲给 Relay。只有 block 中间那一段是工作，前后分析一律丢弃：
+
+```text
+这里是 GPT 给用户看的分析。
+这里不允许传递给 WorkBuddy。
+
+[ZHIXING_RELAY]
+TYPE: TASK
+TASK_ID: task-001
+SOURCE: GPT
+
+真正任务正文
+[ZHIXING_RELAY_END]
+
+这里也是普通解释。
+```
+
+上面这段只会把 block 本身发给 WorkBuddy，两段正文都不会出现。
+
+判定规则（都是"非任务"，不调度、不入 pending、不改状态、不发送）：
+
+| 情况 | 结果 |
+| --- | --- |
+| 没有 `[ZHIXING_RELAY]` | 忽略，日志 `GPT reply observed, but no relay task` |
+| `TYPE:` 为空 | 忽略（`empty_type`） |
+| 没有 `TYPE` 头 | 忽略（`missing_type`） |
+| `TYPE: RESULT` | 忽略（`type_result`，防递归） |
+| 其他未知 TYPE | 忽略（`unknown_type`） |
+| `TYPE: TASK` 但没有 `TASK_ID` | 忽略（`missing_task_id` / `empty_task_id`），不自动生成 ID |
+| 一条消息里有多个完整 block | 忽略（`ambiguous:N_blocks`），不猜、不执行多个 |
+
+标记必须独占一行才算：`[ZHIXING_RELAY]` 出现在正文或 code fence 里不会切开 block；
+`TYPE: TASK` 出现在 body 里也不会被误判成 header。header 只在 block 开头那一段连续
+`KEY: value` 行里读。
+
+### 5.0.1 旧格式兼容（legacy）
+
+`[ZHIXING_RELAY_END]` 是新增的正式结尾。如果 envelope 没有 END 标记，按旧格式解析到消息末尾，
+日志里会注明用了 legacy envelope。Relay 自己发给 GPT 的 `TYPE: RESULT` 仍然是无 END 的旧格式，
+所以这条分支必须保留。
 
 普通解释：
 

@@ -14,6 +14,7 @@ import {
 import type { ModelDefinition } from "../src/model-router/index.js";
 import { ZhixingRelay } from "../src/relay.js";
 import { RelayStore } from "../src/store.js";
+import { wrapWorkBuddyResult } from "../src/protocol.js";
 import type { ExtensionInbound, PendingItem } from "../src/types.js";
 import type { WorkBuddyClient } from "../src/workbuddy.js";
 import { WorkBuddyModelError } from "../src/workbuddy/model.js";
@@ -93,6 +94,8 @@ type Harness = {
   store: RelayStore;
   calls: Call[];
   sentToChatGpt: string[];
+  /** Exactly what was typed into WorkBuddy, in order. */
+  sentToWorkBuddy: string[];
   auditEvents: { event: string; payload: Record<string, unknown> }[];
   /** What the real WorkBuddy UI claims is currently selected. */
   currentModel: string;
@@ -116,6 +119,11 @@ type Harness = {
   routerThrow: Error | null;
   /** False makes the relay hold its RESULT instead of forwarding it. */
   bridgeConnected: boolean;
+  /** Dispatches an assistant reply with exactly this text. */
+  dispatchText: (
+    text: string,
+    mode?: "barrier" | "complete",
+  ) => Promise<void>;
   /** Runs a full turn to completion, optionally naming a model in the task. */
   sendTask: (taskId: string, model?: string | null) => Promise<void>;
   /** Returns once THIS turn reaches WorkBuddy but before the reply arrives. */
@@ -142,9 +150,19 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  // Removed once at the end: a late write from a settled wait must not race
-  // against a directory that no longer exists.
-  await rm(sandboxRoot, { recursive: true, force: true });
+  /*
+   * Removed once at the end: a late write from a settled wait must not race
+   * against a directory that no longer exists. The drain and the retries cover
+   * the other side of that race - a write still in flight when this runs,
+   * which leaves the directory non-empty and the removal failing.
+   */
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await rm(sandboxRoot, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 10,
+  });
 });
 
 afterEach(async () => {
@@ -188,6 +206,7 @@ async function makeHarness(
   const calls: Call[] = [];
   const records: DispatchRecord[] = [];
   const sentToChatGpt: string[] = [];
+  const sentToWorkBuddy: string[] = [];
   const auditEvents: { event: string; payload: Record<string, unknown> }[] = [];
 
   /** The dispatch currently in flight, or 0 while nothing is dispatching. */
@@ -216,6 +235,7 @@ async function makeHarness(
     store,
     calls,
     sentToChatGpt,
+    sentToWorkBuddy,
     auditEvents,
     currentModel: "Hy4 preview",
     selectModelError: null,
@@ -253,8 +273,9 @@ async function makeHarness(
       h.currentModel = label;
       return { changed: true, previous: null, current: label };
     },
-    sendText: async () => {
+    sendText: async (text: string) => {
       record("workbuddy.sendText");
+      sentToWorkBuddy.push(text);
       if (h.sendTextError) throw new Error(h.sendTextError);
       return "wb-1";
     },
@@ -354,9 +375,9 @@ async function makeHarness(
   h.relay = relay;
   h.router = router;
 
-  const dispatchTo = (
-    taskId: string,
-    model?: string | null,
+  const dispatchAssistants = (
+    text: string,
+    prefix = "fp",
   ): Promise<void> => {
     if (!messageHandler) throw new Error("bridge handler was never registered");
     /*
@@ -366,10 +387,15 @@ async function makeHarness(
     fingerprintSeq += 1;
     return messageHandler({
       type: "chatgpt_assistant_message",
-      text: taskText(taskId, model),
-      fingerprint: `fp-${taskId}-${fingerprintSeq}`,
+      text,
+      fingerprint: `${prefix}-${fingerprintSeq}`,
     });
   };
+
+  const dispatchTo = (
+    taskId: string,
+    model?: string | null,
+  ): Promise<void> => dispatchAssistants(taskText(taskId, model), `fp-${taskId}`);
 
   /**
    * Dispatches one task inside a fresh dispatch scope.
@@ -378,9 +404,8 @@ async function makeHarness(
    * by counting historical ones. `complete` waits for the whole turn.
    */
   const startDispatch = async (
-    taskId: string,
+    produce: () => Promise<void>,
     mode: "barrier" | "complete",
-    model?: string | null,
   ): Promise<void> => {
     const record_: DispatchRecord = {
       id: nextDispatchId++,
@@ -394,7 +419,7 @@ async function makeHarness(
     const restore = (): void => {
       activeDispatchId = 0;
     };
-    const finished = dispatchTo(taskId, model).then(restore, (error: unknown) => {
+    const finished = produce().then(restore, (error: unknown) => {
       restore();
       throw error;
     });
@@ -416,12 +441,21 @@ async function makeHarness(
 
   h.sendTask = async (taskId: string, model?: string | null) => {
     if (!messageHandler) await relay.init();
-    await startDispatch(taskId, "complete", model);
+    await startDispatch(() => dispatchTo(taskId, model), "complete");
   };
 
   h.startTask = async (taskId: string, model?: string | null) => {
     if (!messageHandler) await relay.init();
-    await startDispatch(taskId, "barrier", model);
+    await startDispatch(() => dispatchTo(taskId, model), "barrier");
+  };
+
+  /** Dispatches a reply with exactly this text, prose and block and all. */
+  h.dispatchText = async (
+    text: string,
+    mode: "barrier" | "complete" = "complete",
+  ) => {
+    if (!messageHandler) await relay.init();
+    await startDispatch(() => dispatchAssistants(text, "fp-text"), mode);
   };
 
   h.settle = async (id?: number) => {
@@ -1574,5 +1608,223 @@ describe("model router <> relay integration", () => {
     // The hand-off is audited with how long the relay had been up.
     const entry = h.auditEvents.find((e) => e.event === "relay_restart_requested");
     expect(typeof entry?.payload.uptimeMs).toBe("number");
+  });
+});
+
+// v0.4.5: a GPT reply is addressed to a human and to Relay at the same time.
+// Only the block between [ZHIXING_RELAY] and [ZHIXING_RELAY_END] may become
+// work, and anything that is not a well-formed TASK block stays inert.
+
+describe("relay protocol - what reaches WorkBuddy", () => {
+  /** The reason the relay recorded for a reply it left alone. */
+  function rejectionReason(
+    h: Awaited<ReturnType<typeof makeHarness>>,
+  ): unknown {
+    return h.auditEvents.find((e) => e.event === "gpt_reply_not_dispatched")
+      ?.payload.reason;
+  }
+
+  it("sends only the block when the reply explains first and signs off after", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.dispatchText(
+      [
+        "先说明一下我的判断：这次不需要改路由。",
+        "",
+        "[ZHIXING_RELAY]",
+        "TYPE: TASK",
+        "TASK_ID: t-extracted",
+        "SOURCE: GPT",
+        "MODEL: hy3",
+        "",
+        "Run the gate.",
+        "[ZHIXING_RELAY_END]",
+        "",
+        "以上如果有问题再喊我。",
+      ].join("\n"),
+      "barrier",
+    );
+
+    expect(h.sentToWorkBuddy).toHaveLength(1);
+    const sent = h.sentToWorkBuddy[0] ?? "";
+
+    expect(sent).toContain("[ZHIXING_RELAY]");
+    expect(sent).toContain("TASK_ID: t-extracted");
+    expect(sent).toContain("MODEL: hy3");
+    expect(sent).toContain("Run the gate.");
+    expect(sent).toContain("[ZHIXING_RELAY_END]");
+
+    // The analysis and the closing remark never reach WorkBuddy.
+    expect(sent).not.toContain("这次不需要改路由");
+    expect(sent).not.toContain("以上如果有问题再喊我");
+
+    // And the MODEL header was understood, not merely forwarded.
+    expect(modelRouted(h.auditEvents)).toMatchObject({
+      requestedModelId: IDS.hy3,
+    });
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-extracted");
+  });
+
+  it("keeps a body with a code fence and a pseudo header intact", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.dispatchText(
+      [
+        "分析到这里。",
+        "[ZHIXING_RELAY]",
+        "TYPE: TASK",
+        "TASK_ID: t-fenced",
+        "SOURCE: GPT",
+        "",
+        "跑一次门禁：",
+        "```bash",
+        "pnpm check",
+        "```",
+        "",
+        "TYPE: RESULT",
+        "TASK_ID: t-fake",
+        "[ZHIXING_RELAY_END]",
+        "结束。",
+      ].join("\n"),
+      "barrier",
+    );
+
+    expect(h.sentToWorkBuddy).toHaveLength(1);
+    const sent = h.sentToWorkBuddy[0] ?? "";
+
+    expect(sent).toContain("```bash\npnpm check\n```");
+    expect(sent).toContain("TYPE: RESULT\nTASK_ID: t-fake");
+    expect(sent).not.toContain("分析到这里。");
+    expect(sent).not.toContain("结束。");
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-fenced");
+  });
+
+  it("does nothing at all for a reply with no relay block", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.dispatchText("普通回复，你的任务列表里没有需要处理的。");
+
+    expect(h.sentToWorkBuddy).toEqual([]);
+    expect(h.store.snapshot().pending).toEqual([]);
+    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(h.store.snapshot().paused).toBe(false);
+    expect(rejectionReason(h)).toBe("no_block");
+  });
+
+  it("ignores an envelope that carries no TYPE, or a blank one", async () => {
+    for (const type of ["", null]) {
+      const h = await makeHarness();
+      h.waitOutcome = { ok: true };
+
+      const headers = ["[ZHIXING_RELAY]", "TASK_ID: t-no-type", "SOURCE: GPT"];
+      if (type !== null) headers.push(`TYPE: ${type}`);
+
+      await h.dispatchText([...headers, "", "hello", "[ZHIXING_RELAY_END]"].join("\n"));
+
+      expect(h.sentToWorkBuddy).toEqual([]);
+      expect(h.store.snapshot().pending).toEqual([]);
+      expect(h.store.snapshot().currentTask).toBeNull();
+      expect(rejectionReason(h)).toBe(
+        type === null ? "missing_type" : "empty_type",
+      );
+    }
+  });
+
+  it("never dispatches a RESULT envelope back into WorkBuddy", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.dispatchText(
+      wrapWorkBuddyResult({
+        taskId: "t-recursion",
+        workbuddyMessageId: "wb-1",
+        body: "task done",
+      }),
+    );
+
+    expect(h.sentToWorkBuddy).toEqual([]);
+    expect(h.store.snapshot().pending).toEqual([]);
+    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(rejectionReason(h)).toBe("type_result");
+  });
+
+  it("refuses to dispatch a TASK envelope that names no task id", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.dispatchText(
+      [
+        "分析。",
+        "[ZHIXING_RELAY]",
+        "TYPE: TASK",
+        "SOURCE: GPT",
+        "",
+        "Run the gate.",
+        "[ZHIXING_RELAY_END]",
+      ].join("\n"),
+    );
+
+    expect(h.sentToWorkBuddy).toEqual([]);
+    expect(h.store.snapshot().pending).toEqual([]);
+    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(rejectionReason(h)).toBe("missing_task_id");
+  });
+
+  it("refuses to guess between two complete blocks in one message", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.dispatchText(
+      [
+        "看这个例子：",
+        "",
+        "[ZHIXING_RELAY]",
+        "TYPE: TASK",
+        "TASK_ID: t-first",
+        "",
+        "first",
+        "[ZHIXING_RELAY_END]",
+        "",
+        "真正的任务：",
+        "",
+        "[ZHIXING_RELAY]",
+        "TYPE: TASK",
+        "TASK_ID: t-second",
+        "",
+        "second",
+        "[ZHIXING_RELAY_END]",
+      ].join("\n"),
+    );
+
+    expect(h.sentToWorkBuddy).toEqual([]);
+    expect(h.store.snapshot().pending).toEqual([]);
+    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(rejectionReason(h)).toBe("ambiguous:2_blocks");
+  });
+
+  it("still accepts a legacy task that was never closed", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.dispatchText(
+      [
+        "分析。",
+        "[ZHIXING_RELAY]",
+        "TYPE: TASK",
+        "TASK_ID: t-legacy",
+        "SOURCE: GPT",
+        "",
+        "Run the gate.",
+      ].join("\n"),
+      "barrier",
+    );
+
+    expect(h.sentToWorkBuddy).toHaveLength(1);
+    expect(h.sentToWorkBuddy[0]).toContain("TASK_ID: t-legacy");
+    expect(h.sentToWorkBuddy[0]).not.toContain("分析。");
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-legacy");
   });
 });

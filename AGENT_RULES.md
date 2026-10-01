@@ -77,6 +77,16 @@ POST /control/heartbeat -> relay.emitHeartbeat()
 
 ## 5. Long-running terminal
 
+## 6. A GPT reply is only work between the markers
+
+Every ChatGPT message that reaches the relay is classified by
+`readRelayIntent()` in `src/protocol.ts`. Only `TYPE: TASK` with a non-empty
+`TASK_ID` becomes work, and only the `[ZHIXING_RELAY]` … `[ZHIXING_RELAY_END]`
+block is forwarded - never the surrounding prose. An envelope with a blank
+`TYPE`, no `TYPE`, `TYPE: RESULT`, two complete blocks in one message, or a
+`TASK` without a `TASK_ID` is ignored on purpose: nothing is queued, nothing is
+paused, nothing is sent. Do not "help" by making one of those paths dispatch.
+
 A relay that is only ever started from a plain `cmd.exe` window dies with that
 window. Prefer Windows Terminal or a supervisor (`pm2`) for anything that has
 to survive a lock screen, and turn off **Quick Edit** in the console
