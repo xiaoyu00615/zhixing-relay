@@ -335,6 +335,24 @@ TypeScript typecheck
 Vitest
 ```
 
+## 13. 常驻运行规则（改代码的人必读）
+
+Relay 同时是 ChatGPT 与 WorkBuddy 之间的链路。任何重启进程的操作都会
+让 Chrome 扩展连到一个已经不存在的 socket，症状是"GPT 发任务、没有任何回音"。
+
+- **不要**因为改了源码就杀掉或重启 Relay；先提交，然后由人决定何时断开链路。
+- 需要重启时只用 `restart` 命令（graceful）：它会在任务在飞 / Relay 处于
+  PAUSED 时拒绝，否则关桥、写 `relay_restart_requested` 审计再退出。
+- 详见 [AGENT_RULES.md](./AGENT_RULES.md)。
+
+## 14. 存活确认（heartbeat）
+
+Relay 每 `HEARTBEAT_MS`（默认 30s）打印一次 `[relay-heartbeat]`，内容包含
+时间、uptime、state、paused、currentTask、bridge、workbuddy、pending。
+超过 `HEARTBEAT_STALE_MS`（默认 60s）没有 heartbeat，会写 `heartbeat_stale`
+审计并在日志报错。命令行 `status` 会额外给出 `uptime`、`lastHeartbeatAt`、
+`lastHeartbeatAgeMs`、`heartbeatStale`、`bridgeAgeMs`、`lastTaskAt`。
+
 ## 安全说明
 
 - Relay 只监听 `127.0.0.1`。
@@ -347,6 +365,26 @@ Vitest
 
 
 ## Milestone
+
+### v0.4.4.1-runtime-stability
+
+- `[relay-heartbeat]` every `HEARTBEAT_MS`, with a `HEARTBEAT_STALE_MS` watchdog
+  that writes `heartbeat_stale` and logs an error when a beat goes missing.
+- `status` reports `uptime`, `lastHeartbeatAt` / `lastHeartbeatAgeMs`,
+  `heartbeatStale`, `bridgeAgeMs`, `lastTaskAt` / `lastTaskAgeMs`.
+- Startup diagnostics block, so a misconfiguration is visible without a task.
+- Graceful `restart` command that refuses while a round is in flight.
+- `AGENT_RULES.md`: the relay must never be killed just because a file changed.
+
+### v0.4.4-lifecycle-stability
+
+- RESULT delivery closes the round: `completeCurrentRound("result_delivered")`
+  clears `currentTask`, returns the relay to IDLE and drains the queue.
+- `RESULT_LEASE_MS` releases a delivered-but-unacknowledged task
+  (`result_lease_expired`), with a sweep for leases lost to a restart.
+- `flushOnePending` only dequeues when the relay is truly idle.
+- Failed / cancelled tasks return to the queue with a bounded retry count.
+- A `TYPE: RESULT` pasted into ChatGPT is a completion signal, never chatter.
 
 ### v0.1.0-workbuddy-cdp
 

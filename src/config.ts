@@ -48,6 +48,14 @@ export function loadConfig() {
        * refuses cannot cycle for ever.
        */
       maxTaskRetries: envInt("RELAY_MAX_TASK_RETRIES", 3),
+      /**
+       * The heartbeat that makes a wedged terminal visible: a relay whose
+       * log stops here has stopped really running, even if the console
+       * window still looks alive.
+       */
+      heartbeatMs: envInt("HEARTBEAT_MS", 30_000),
+      /** How long without a heartbeat before the watchdog complains. */
+      heartbeatStaleMs: envInt("HEARTBEAT_STALE_MS", 60_000),
     },
     workbuddy: {
       baseUrl: process.env.WORKBUDDY_BASE_URL || "https://www.workbuddy.cn",

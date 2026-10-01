@@ -26,7 +26,13 @@ const IDS = {
   glm: "glm-5.3-flash",
 } as const;
 
-const NOW = new Date("2026-10-01T00:00:00.000Z");
+/*
+ * Anchored to load time, never to a fixed calendar instant: the router treats
+ * a block whose `blockedUntil` is in the past as already expired, so a
+ * hard-coded instant silently turned every "blocked model" case into a
+ * "nothing is blocked" case once wall-clock time passed it.
+ */
+const NOW = new Date();
 const BLOCK_2H = new Date(NOW.getTime() + 7_200_000);
 /** The reset instant WorkBuddy prints in its quota notice. */
 const RESET_AT = new Date(NOW.getTime() + 7_200_000).toISOString();
@@ -1497,5 +1503,76 @@ describe("model router <> relay integration", () => {
       true,
     );
     expect(h.router.pinnedModelId()).toBeNull();
+  });
+
+  // v0.4.4.1: a relay that has to run for days must be able to report that
+  // it is still alive, and must not let a restart cut a live round in half.
+
+  it("reports lifecycle health in status(), and stamps a beat", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.sendTask("t-health");
+
+    const status = h.relay.status();
+
+    // Uptime, ages and the heartbeat window are all numbers, not guesses.
+    expect(status.uptimeMs).toBeGreaterThanOrEqual(0);
+    expect(typeof status.uptime).toBe("string");
+    expect(status.heartbeatMs).toBeGreaterThan(0);
+    expect(status.heartbeatStaleMs).toBeGreaterThan(status.heartbeatMs);
+    expect(status.heartbeatStale).toBe(false);
+
+    // The beat touched after the last task, so "idle" is an age, not a void.
+    expect(typeof status.lastTaskAt).toBe("string");
+    expect(status.lastTaskAgeMs).toBeGreaterThanOrEqual(0);
+
+    // The bridge never dropped in this harness, so its age exists.
+    expect(status.bridgeConnected).toBe(true);
+    expect(status.bridgeAgeMs).toBeGreaterThanOrEqual(0);
+
+    const block = h.relay.emitHeartbeat();
+
+    expect(block).toContain("[relay-heartbeat]");
+    expect(block).toContain(`currentTask=null`);
+    expect(block).toContain(`state=IDLE`);
+    expect(block).toContain(`pending=0`);
+
+    // The beat is remembered, and it is only late once it is really late.
+    expect(h.relay.status().lastHeartbeatAt).toBeTruthy();
+    expect(h.relay.status().heartbeatStale).toBe(false);
+  });
+
+  it("refuses a graceful restart while a round is in flight", async () => {
+    const h = await makeHarness();
+
+    await h.startTask("t-restart-busy");
+
+    const result = await h.relay.requestRestart("suspicious");
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("t-restart-busy");
+    // Refused, so the bridge is still the one the extension talks to.
+    expect(h.relay.status().bridgeConnected).toBe(true);
+
+    await h.settle();
+  });
+
+  it("prepares a clean restart once nothing is in flight", async () => {
+    const h = await makeHarness();
+    h.waitOutcome = { ok: true };
+
+    await h.sendTask("t-restart-idle");
+
+    const result = await h.relay.requestRestart("after a code change");
+
+    expect(result.ok).toBe(true);
+    expect(result.message.length).toBeGreaterThan(0);
+    expect(h.auditEvents.some((e) => e.event === "relay_restart_requested")).toBe(
+      true,
+    );
+    // The hand-off is audited with how long the relay had been up.
+    const entry = h.auditEvents.find((e) => e.event === "relay_restart_requested");
+    expect(typeof entry?.payload.uptimeMs).toBe("number");
   });
 });

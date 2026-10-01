@@ -13,7 +13,9 @@ export function startCli(relay: ZhixingRelay): readline.Interface {
   console.log("  p | pause              Pause automatic forwarding");
   console.log("  r | resume             Resume and flush one pending item");
   console.log("  s | stop               Stop current relay round");
-  console.log("  status                 Show state");
+  console.log("  status                 Show state (uptime / heartbeat / bridge age)");
+  console.log("  heartbeat              Print one beat immediately");
+  console.log("  restart                Graceful stop so the process can be started again");
   console.log("  wb <text>              Manually send text to WorkBuddy");
   console.log("  gpt <text>             Stage text in ChatGPT (no auto-send)");
   console.log("  x | exit               Emergency stop and exit");
@@ -45,6 +47,22 @@ export function startCli(relay: ZhixingRelay): readline.Interface {
         return;
       }
 
+      if (input === "heartbeat" || input === "hb") {
+        relay.emitHeartbeat();
+        return;
+      }
+
+      if (input === "restart") {
+        const result = await relay.requestRestart("cli restart command");
+        console.log(`[relay] ${result.message}`);
+        if (result.ok) {
+          console.log("[relay] exiting so the port is free for the next start");
+          rl.close();
+          process.exit(0);
+        }
+        return;
+      }
+
       if (input.startsWith("wb ")) {
         await relay.sendManualToWorkBuddy(input.slice(3).trim());
         return;
@@ -63,7 +81,9 @@ export function startCli(relay: ZhixingRelay): readline.Interface {
       }
 
       if (input === "help") {
-        console.log("p/pause, r/resume, s/stop, status, wb <text>, gpt <text>, x/exit");
+        console.log(
+          "p/pause, r/resume, s/stop, status, heartbeat, restart, wb <text>, gpt <text>, x/exit",
+        );
         return;
       }
 

@@ -34,7 +34,7 @@ async function main(): Promise<void> {
   await bridge.start();
 
   console.log("");
-  console.log("ZHIXING RELAY v0.1.0");
+  console.log("ZHIXING RELAY");
   console.log(`Bridge: ws://${config.relay.host}:${config.relay.port}`);
   console.log(`GPT forward mode: ${config.relay.gptForwardMode}`);
   console.log(
@@ -53,6 +53,17 @@ async function main(): Promise<void> {
   }
 
   console.log("Chrome extension: waiting for connection...");
+
+  for (const line of relay.startupDiagnostics()) {
+    console.log(line);
+  }
+
+  /*
+   * Prove the process is alive even when the console window stops painting:
+   * a beat every HEARTBEAT_MS, and a complaint when a beat goes missing.
+   */
+  relay.startHeartbeat();
+
   startCli(relay);
 
   const shutdown = async (signal: string) => {

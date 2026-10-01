@@ -7,6 +7,13 @@ import {
   shouldForwardAssistantMessage,
   wrapWorkBuddyResult,
 } from "./protocol.js";
+import {
+  formatDuration,
+  formatHeartbeat,
+  heartbeatAgeMs,
+  isHeartbeatStale,
+  shouldWarnHeartbeat,
+} from "./heartbeat.js";
 import { RelayStore } from "./store.js";
 import type { ExtensionInbound, PendingItem, WorkBuddyMessage } from "./types.js";
 import { browserFingerprint, isoNow, makeId } from "./utils.js";
@@ -50,6 +57,15 @@ export class ZhixingRelay {
   /** Attempts already spent on one taskId, so a retry has a number. */
   private taskAttempts = new Map<string, number>();
 
+  /** Lifecycle facts the heartbeat and `status` both report. */
+  private startedAt = Date.now();
+  private lastHeartbeatAt: number | null = null;
+  private lastTaskAt: number | null = null;
+  private bridgeSince: number | null = null;
+  private heartbeatWarned = false;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor(
     private readonly config: AppConfig,
     private readonly bridge: BridgeServer,
@@ -92,9 +108,217 @@ export class ZhixingRelay {
   }
 
   status() {
+    const snapshot = this.store.snapshot();
+    const now = Date.now();
+    const bridgeUp = this.bridge.hasClient();
+
     return {
-      ...this.store.snapshot(),
-      bridgeConnected: this.bridge.hasClient(),
+      ...snapshot,
+      bridgeConnected: bridgeUp,
+      uptimeMs: now - this.startedAt,
+      uptime: formatDuration(now - this.startedAt),
+      lastHeartbeatAt:
+        this.lastHeartbeatAt === null ? null : new Date(this.lastHeartbeatAt).toISOString(),
+      lastHeartbeatAgeMs: heartbeatAgeMs(this.lastHeartbeatAt, now),
+      heartbeatMs: this.heartbeatMs(),
+      heartbeatStaleMs: this.heartbeatStaleMs(),
+      heartbeatStale: isHeartbeatStale({
+        lastHeartbeatAt: this.lastHeartbeatAt,
+        startedAt: this.startedAt,
+        now,
+        maxAgeMs: this.heartbeatStaleMs(),
+      }),
+      /** How long the ChatGPT bridge has been up, null when it never was. */
+      bridgeAgeMs: bridgeUp
+        ? now - (this.bridgeSince ?? this.startedAt)
+        : null,
+      lastTaskAt: this.lastTaskAt === null ? null : new Date(this.lastTaskAt).toISOString(),
+      lastTaskAgeMs: this.lastTaskAt === null ? null : Math.max(0, now - this.lastTaskAt),
+    };
+  }
+
+  /** HEARTBEAT_MS, how often the relay proves it is still running. */
+  private heartbeatMs(): number {
+    const configured = this.config.relay?.heartbeatMs;
+    return typeof configured === "number" && configured > 0
+      ? configured
+      : 30_000;
+  }
+
+  /** HEARTBEAT_STALE_MS, when a missing heartbeat is treated as a fault. */
+  private heartbeatStaleMs(): number {
+    const configured = this.config.relay?.heartbeatStaleMs;
+    return typeof configured === "number" && configured > 0
+      ? configured
+      : 60_000;
+  }
+
+  /**
+   * Starts the heartbeat and its watchdog.
+   *
+   * Deliberately not part of init(): a relay that is only used for one call
+   * should not keep a timer alive, and a test must not inherit a ticking
+   * process.
+   */
+  startHeartbeat(): void {
+    this.stopHeartbeat();
+
+    const beat = () => {
+      this.emitHeartbeat();
+    };
+
+    this.heartbeatTimer = setInterval(beat, this.heartbeatMs());
+    this.heartbeatTimer.unref?.();
+
+    // Ticks more often than it speaks, so the warning lands right after the
+    // window closes rather than a whole interval late.
+    this.watchdogTimer = setInterval(() => this.runWatchdog(), 5_000);
+    this.watchdogTimer.unref?.();
+
+    this.emitHeartbeat();
+  }
+
+  stopHeartbeat(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.heartbeatTimer = null;
+    this.watchdogTimer = null;
+  }
+
+  /** One heartbeat, printed and returned so it can also be asked for. */
+  emitHeartbeat(): string {
+    const snapshot = this.store.snapshot();
+    const now = Date.now();
+
+    this.lastHeartbeatAt = now;
+    this.heartbeatWarned = false;
+
+    const block = formatHeartbeat(now, {
+      startedAt: this.startedAt,
+      lastHeartbeatAt: this.lastHeartbeatAt,
+      state: snapshot.state,
+      paused: snapshot.paused,
+      currentTask: snapshot.currentTask?.taskId ?? null,
+      bridge: this.bridge.hasClient(),
+      workbuddy: true,
+      pending: snapshot.pending.length,
+    });
+
+    console.log(block);
+
+    return block;
+  }
+
+  /**
+   * The watchdog. A missed beat means the event loop is stuck or the
+   * terminal froze: nothing can unstick it, so it must be loud.
+   */
+  private async runWatchdog(): Promise<void> {
+    const now = Date.now();
+    const stale = isHeartbeatStale({
+      lastHeartbeatAt: this.lastHeartbeatAt,
+      startedAt: this.startedAt,
+      now,
+      maxAgeMs: this.heartbeatStaleMs(),
+    });
+
+    if (!stale) {
+      this.heartbeatWarned = false;
+      return;
+    }
+
+    if (!shouldWarnHeartbeat({ stale, wasWarned: this.heartbeatWarned })) return;
+
+    this.heartbeatWarned = true;
+
+    await this.audit.write("heartbeat_stale", {
+      lastHeartbeatAt: this.lastHeartbeatAt === null ? null : new Date(this.lastHeartbeatAt).toISOString(),
+      now: new Date(now).toISOString(),
+      staleAfterMs: this.heartbeatStaleMs(),
+    });
+
+    console.error(
+      `[relay] HEARTBEAT STALE: no ${this.heartbeatMs()}ms heartbeat for over ${this.heartbeatStaleMs()}ms. ` +
+        "The event loop is wedged or the console is frozen (Windows Quick Edit); a keystroke usually unsticks it.",
+    );
+  }
+
+  /** Marks a round as having touched a task, so `status` can show idleness. */
+  private noteTaskActivity(): void {
+    this.lastTaskAt = Date.now();
+  }
+
+  /**
+   * Remembered when the ChatGPT bridge comes back, so a reconnect age can be
+   * reported instead of a lifetime uptime.
+   */
+  private noteBridgeTraffic(): void {
+    if (this.bridge.hasClient() && this.bridgeSince === null) {
+      this.bridgeSince = Date.now();
+    }
+  }
+
+  /**
+   * A one-line-per-fact summary of how this process was configured, printed
+   * once at startup so a bad configuration is visible without a task.
+   */
+  startupDiagnostics(): string[] {
+    const snapshot = this.store.snapshot();
+    const relayCfg = this.config.relay;
+
+    const lines = [
+      `[relay] startup diagnostics`,
+      `  node=${process.version} pid=${process.pid} platform=${process.platform}`,
+      `  bridge=ws://${relayCfg?.host ?? "127.0.0.1"}:${relayCfg?.port ?? 8787}`,
+      `  forward=${relayCfg?.gptForwardMode ?? "tagged"} autoSend=${relayCfg?.autoSendToChatGPT ? "true" : "false"} pauseOnManual=${relayCfg?.pauseOnManualUserMessage ? "true" : "false"}`,
+      `  resultLeaseMs=${this.resultLeaseMs()} maxTaskRetries=${this.maxTaskRetries()}`,
+      `  heartbeat=${this.heartbeatMs()}ms staleAfter=${this.heartbeatStaleMs()}ms`,
+      `  loadedFrom: state=${snapshot.state} paused=${snapshot.paused ? "true" : "false"} pending=${snapshot.pending.length} currentTask=${snapshot.currentTask?.taskId ?? "null"}`,
+    ];
+
+    return lines;
+  }
+
+  /**
+   * Graceful restart hand-off.
+   *
+   * Restarting the relay is the one operation that can cut the link between
+   * ChatGPT and WorkBuddy, so it refuses while a round is in flight and it
+   * reports what an operator has to do instead of quietly killing anything.
+   */
+  async requestRestart(reason: string): Promise<{ ok: boolean; message: string }> {
+    const snapshot = this.store.snapshot();
+
+    if (snapshot.currentTask) {
+      return {
+        ok: false,
+        message:
+          `refusing to restart while task ${snapshot.currentTask.taskId} is in flight ` +
+          "(status=" + snapshot.currentTask.status + "). Stop the round first (`s`), then restart.",
+      };
+    }
+
+    if (snapshot.paused) {
+      return {
+        ok: false,
+        message: "refusing to restart while the relay is PAUSED. Resume (`r`) or stop the round (`s`) first.",
+      };
+    }
+
+    this.stopHeartbeat();
+    await this.bridge.close();
+
+    await this.audit.write("relay_restart_requested", {
+      reason,
+      uptimeMs: Date.now() - this.startedAt,
+      pending: snapshot.pending.length,
+    });
+
+    return {
+      ok: true,
+      message:
+        "graceful restart prepared: bridge closed and audit written, the process can now be " +
+        "started again with `pnpm start`. Never kill the process while the extension is connected.",
     };
   }
 
@@ -170,6 +394,7 @@ export class ZhixingRelay {
   async emergencyStop(): Promise<void> {
     await this.pause("emergency");
     await this.stopCurrentRound("emergency");
+    this.stopHeartbeat();
     await this.bridge.close();
     await this.audit.write("relay_emergency_stop");
   }
@@ -205,6 +430,7 @@ export class ZhixingRelay {
     // An incoming message is a chance to release a lease that a restart left
     // behind, even when the timer is not running any more.
     await this.checkResultLease();
+    this.noteBridgeTraffic();
 
     switch (message.type) {
       case "bridge_hello":
@@ -389,6 +615,7 @@ export class ZhixingRelay {
   }
 
   private async startWorkBuddyTask(text: string, sourceFingerprint: string): Promise<void> {
+    this.noteTaskActivity();
     console.log("[Relay] startWorkBuddyTask BEGIN");
 
   const snapshot = this.store.snapshot();
@@ -1189,6 +1416,8 @@ export class ZhixingRelay {
         state.state = state.paused ? "PAUSED" : "IDLE";
       }
     });
+
+    this.noteTaskActivity();
 
     await this.audit.write("round_completed", {
       taskId,
