@@ -32,6 +32,13 @@ export function loadConfig() {
       host: process.env.RELAY_HOST || "127.0.0.1",
       port: envInt("RELAY_PORT", 8787),
       sharedSecret: process.env.RELAY_SHARED_SECRET || "",
+      /**
+       * The runtime control channel. Loopback only, guarded by the same
+       * secret the bridge uses; it exists because a relay supervised by pm2
+       * has no console left to type `r` into after a startup pause.
+       * `RELAY_CONTROL_PORT=0` lets the OS pick a free port.
+       */
+      controlPort: envInt("RELAY_CONTROL_PORT", 8788),
       pauseOnManualUserMessage: envBool("PAUSE_ON_MANUAL_USER_MESSAGE", true),
       autoSendToChatGPT: envBool("AUTO_SEND_TO_CHATGPT", true),
       gptForwardMode: forwardMode as "tagged" | "all",

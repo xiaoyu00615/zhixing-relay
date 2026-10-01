@@ -62,6 +62,8 @@ export class ZhixingRelay {
   private lastHeartbeatAt: number | null = null;
   private lastTaskAt: number | null = null;
   private bridgeSince: number | null = null;
+  /** Last WorkBuddy liveness probe, null until the first one ran. */
+  private workbuddyUp: boolean | null = null;
   private heartbeatWarned = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
@@ -103,8 +105,17 @@ export class ZhixingRelay {
     this.bridge.onMessage((message) => this.onExtensionMessage(message));
   }
 
+  /**
+   * Probes WorkBuddy and remembers the answer.
+   *
+   * The result is kept because `status()` and the heartbeat have to report
+   * the liveness synchronously: an HTTP caller must not force the process to
+   * open another CDP connection to ask a question it can already answer.
+   */
   async workbuddyOnline(): Promise<boolean> {
-    return this.workbuddy.online();
+    const online = await this.workbuddy.online();
+    this.workbuddyUp = online;
+    return online;
   }
 
   status() {
@@ -115,6 +126,8 @@ export class ZhixingRelay {
     return {
       ...snapshot,
       bridgeConnected: bridgeUp,
+      /** Last known WorkBuddy liveness, false until a probe says otherwise. */
+      workbuddy: this.workbuddyUp === true,
       uptimeMs: now - this.startedAt,
       uptime: formatDuration(now - this.startedAt),
       lastHeartbeatAt:
@@ -200,7 +213,8 @@ export class ZhixingRelay {
       paused: snapshot.paused,
       currentTask: snapshot.currentTask?.taskId ?? null,
       bridge: this.bridge.hasClient(),
-      workbuddy: true,
+      /** Null-safe: a relay that never probed still reports the link as up. */
+      workbuddy: this.workbuddyUp ?? true,
       pending: snapshot.pending.length,
     });
 

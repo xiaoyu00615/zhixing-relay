@@ -53,7 +53,29 @@ round can be lost mid-flight.
 - `status` in the CLI prints uptime, `lastHeartbeatAt` / `lastHeartbeatAgeMs`,
   `heartbeatStale`, `bridgeAgeMs`, `lastTaskAt` / `lastTaskAgeMs`.
 
-## 4. Long-running terminal
+## 4. The control channel is the console when there is none
+
+Under pm2 the CLI still works but nobody is there to type. The same commands
+are therefore reachable on loopback HTTP, and they call the same methods the
+CLI calls:
+
+```text
+POST /control/resume    -> relay.resume()
+POST /control/pause     -> relay.pause("control_channel")
+POST /control/status    -> relay.status()
+POST /control/restart   -> relay.requestRestart(...)
+POST /control/heartbeat -> relay.emitHeartbeat()
+```
+
+- Header `X-Relay-Secret` is mandatory; no secret or a wrong one answers
+  `401`. Unknown route `404`, non-POST `405`.
+- Only `127.0.0.1` is ever bound. With an empty `RELAY_SHARED_SECRET` the
+  whole channel answers `503` (fails closed).
+- If you need to un-pause a relay that came up PAUSED, send
+  `/control/resume`. Do **not** restart the process to "clear" the state: a
+  restart also drops the bridge.
+
+## 5. Long-running terminal
 
 A relay that is only ever started from a plain `cmd.exe` window dies with that
 window. Prefer Windows Terminal or a supervisor (`pm2`) for anything that has

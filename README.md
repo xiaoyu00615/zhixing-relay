@@ -353,9 +353,34 @@ Relay 每 `HEARTBEAT_MS`（默认 30s）打印一次 `[relay-heartbeat]`，内�
 审计并在日志报错。命令行 `status` 会额外给出 `uptime`、`lastHeartbeatAt`、
 `lastHeartbeatAgeMs`、`heartbeatStale`、`bridgeAgeMs`、`lastTaskAt`。
 
+## 15. Runtime control channel（PM2 下的控制面）
+
+被 pm2 接管后没有终端可以输入 `r`，所以 CLI 的每条命令在同一套实现上再开
+一个 loopback HTTP 入口（`src/control.ts`）。HTTP 只调用 CLI 调用的那个方法，
+不存在第二份逻辑。
+
+| 路由 | 等价操作 | 说明 |
+| --- | --- | --- |
+| `POST /control/status` | `status` | state / paused / currentTask / pending / heartbeat |
+| `POST /control/resume` | `r` | 解除暂停 + flush pending |
+| `POST /control/pause` | `p` | 暂停自动转发 |
+| `POST /control/restart` | `restart` | 优雅停止当前 round（拒绝在飞任务 / PAUSED） |
+| `POST /control/heartbeat` | `heartbeat` | 立刻打一拍 |
+
+```powershell
+$secret = "你的 RELAY_SHARED_SECRET"
+Invoke-RestMethod -Method Post -Headers @{ "X-Relay-Secret" = $secret } `
+  -Uri http://127.0.0.1:8788/control/resume
+```
+
+- 只绑定 `127.0.0.1`（`RELAY_CONTROL_PORT` 默认 8788，`0` 让系统选端口）。
+- 每个请求都要带 `X-Relay-Secret`；缺失或错误 → `401`，未知路由 → `404`，
+  非 POST → `405`。
+- 未配置 `RELAY_SHARED_SECRET` 时通道整体关闭（`503`），**fail closed**。
+
 ## 安全说明
 
-- Relay 只监听 `127.0.0.1`。
+- Relay 只监听 `127.0.0.1`；控制面同样只监听 `127.0.0.1` 且要求 secret。
 - WorkBuddy Token 不进入 Chrome 扩展。
 - Client Secret 不进入 Chrome 扩展。
 - 默认不会自动批准 WorkBuddy 工具权限。
