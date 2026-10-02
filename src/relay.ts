@@ -1859,11 +1859,23 @@ export class ZhixingRelay {
       };
     }
 
-    this.scheduleWork(() => this.flushOnePending());
-
+    /*
+     * Released, and deliberately not dispatching from here.
+     *
+     * A resolution is a decision about one task, not a decision to send it:
+     * the task it put back on the queue has to be re-decided by the queue.
+     * Dispatching eagerly would hand that task straight to the dispatch
+     * decision, which refuses anything already proven sent - and the queue
+     * would then drop it, losing the very task v0.4.7 holds as evidence
+     * instead of retrying it.
+     *
+     * (While the hold was a latch this line could not be reached at all:
+     * every resolution left the hold set and took the branch above.)
+     */
     return {
       ok: true,
-      message: "resolution recorded; scheduling is released and the queue will flush",
+      message:
+        "resolution recorded; scheduling is released and the queue will re-decide the task",
     };
   }
 
@@ -2009,12 +2021,37 @@ export class ZhixingRelay {
       .filter((finding) => finding.severity === "blocking")
       .map((finding) => `${finding.kind}:${finding.taskId}`);
 
+    /*
+     * The answer has to be the same fact `/control/status` reports.
+     * `report.blocked` alone is only half of it: scheduling can also be held
+     * by the live task the relay itself froze, which the ledger knows nothing
+     * about. So what is returned is the runtime hold, read after the
+     * re-reconciliation - the number an operator is about to look up.
+     *
+     * No blocking finding is invented for the live case: it is named in the
+     * message instead, because it is not a statement about a chain.
+     */
+    const held = this.reconciliationHold;
+    const liveHold = this.liveNeedsReconciliation();
+    const parts: string[] = [];
+
+    if (blocking.length > 0) {
+      parts.push(`other chains still block scheduling (${blocking.join(", ")})`);
+    }
+    if (liveHold) {
+      parts.push(
+        "scheduling is still held by the live reconciliation state " +
+          "(the current task needs a human decision)",
+      );
+    }
+
     return {
       ok: true,
-      message: report.blocked
-        ? `task ${taskId} was closed; other chains still block scheduling (${blocking.join(", ")})`
-        : `task ${taskId} was closed and scheduling is no longer held by it`,
-      blocked: report.blocked,
+      message:
+        parts.length > 0
+          ? `task ${taskId} was closed; ${parts.join("; ")}`
+          : `task ${taskId} was closed and scheduling is released`,
+      blocked: held,
       findings: blocking,
     };
   }
@@ -2052,21 +2089,41 @@ export class ZhixingRelay {
        */
       const liveHold = this.liveNeedsReconciliation();
 
-      if (report.blocked || liveHold) {
-        this.reconciliationHold = true;
+      /*
+       * One assignment, and it is unconditional.
+       *
+       * The hold is a statement about the world as this pass just read it,
+       * not a record that something once went wrong - so a pass that comes
+       * back clean has to be able to release it. Assigning `true` only in the
+       * blocked branch turned it into a latch nothing could ever clear, which
+       * is how a production relay went on reporting
+       * `reconciliationHold: true` after the operator had closed the very
+       * task that froze it, with an empty queue and nothing in flight.
+       */
+      const shouldHold = report.blocked || liveHold;
+      this.reconciliationHold = shouldHold;
+
+      if (shouldHold) {
+        const reasons = report.findings
+          .filter((finding) => finding.severity === "blocking")
+          .map((finding) => `${finding.kind}:${finding.taskId}`);
+        // The live state can hold scheduling on its own, and it is not a
+        // ledger finding - it is named here so the log says why.
+        if (liveHold) reasons.push("live:RECONCILIATION_REQUIRED");
+
         await this.audit.write("reconciliation_blocked", {
           reason,
           tasks: report.tasks.map((task) => ({ taskId: task.taskId, state: task.state })),
         });
         console.error(
-          `[relay] reconciliation blocked automatic scheduling (${reason}): ` +
-            `${report.findings.filter((f) => f.severity === "blocking").map((f) => f.kind).join(", ")}`,
+          `[relay] reconciliation blocked automatic scheduling (${reason}): ${reasons.join(", ")}`,
         );
         return report;
       }
 
       console.log(
-        `[relay] reconciliation clean (${reason}): ${report.tasksSeen} task(s) checked`,
+        `[relay] reconciliation clean (${reason}): ${report.tasksSeen} task(s) checked; ` +
+          `scheduling is released`,
       );
       return report;
     } catch (error) {
