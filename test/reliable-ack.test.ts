@@ -1347,4 +1347,57 @@ describe("control surface", () => {
     expect(events).toContain("RECONCILIATION_RESOLVED");
     expect(events.indexOf("DISPATCH_STALLED")).toBeLessThan(events.indexOf("RECONCILIATION_RESOLVED"));
   });
+
+  /*
+   * A task sitting in the queue is not a task the relay lost.
+   *
+   * Reconciliation is handed the live queue and the task in flight, and it is
+   * only with them that it can tell "still mine" from "forgotten": a chain the
+   * ledger knows but the state file no longer lists is exactly what a
+   * reconciliation exists to describe, and the same chain described while the
+   * relay still has it queued is nothing at all.
+   *
+   * The pass is run by closing an unrelated task, so that the chain under test
+   * is judged by the ledger alone and not by the closure that triggers it.
+   */
+  it("does not reconcile a queued task as a task it lost", async () => {
+    const h = await makeHarness();
+
+    const log = new TaskLedger(pathToFileURL(join(h.dir, "ledger.jsonl")));
+    await log.append({
+      event: "TASK_PUBLISHED",
+      taskId: "t-queued",
+      taskFingerprint: "fp-queued",
+      source: "gpt",
+    });
+    await log.append({
+      event: "DISPATCH_STARTED",
+      taskId: "t-queued",
+      taskFingerprint: "fp-queued",
+      dispatchId: "t-queued#0",
+      attempt: 0,
+      source: "relay",
+    });
+
+    await h.store.enqueue({
+      kind: "gpt_task",
+      id: "pending-queued",
+      text: taskBlock("t-queued"),
+      fingerprint: "fp-queued",
+      createdAt: new Date().toISOString(),
+      taskId: "t-queued",
+      attempt: 0,
+      retryCount: 0,
+    });
+
+    const closed = await h.relay.closeReconciledTaskWithoutResend({
+      taskId: "t-pass-trigger",
+      reason: "the pass this case runs",
+    });
+
+    expect(closed.ok).toBe(true);
+    // The queued chain is explained by the queue, so it blocks nothing.
+    expect(closed.blocked).toBe(false);
+    expect(h.store.snapshot().pending).toHaveLength(1);
+  });
 });

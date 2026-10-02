@@ -25,6 +25,8 @@ import {
   ReconciliationService,
   TaskLedger,
   taskFingerprint,
+  type ReconciliationLiveContext,
+  type ReconciliationReport,
 } from "./reconciliation/index.js";
 import {
   advanceStage,
@@ -148,7 +150,9 @@ export class ZhixingRelay {
       onWorkBuddyResult: (taskId, outboundId, body) =>
         this.onWorkBuddyResult(taskId, outboundId, body),
       requeue: (args) => this.requeueTask(args),
-      reconcile: (reason) => this.runReconciliation(reason),
+      reconcile: async (reason) => {
+        await this.runReconciliation(reason);
+      },
       noteActivity: () => this.noteTaskActivity(),
       workAbort: () => this.workAbort,
       setWorkAbort: (controller) => {
@@ -1745,15 +1749,140 @@ export class ZhixingRelay {
    * only safe answer to a chain that cannot be explained - flushing the next
    * task on top of an unexplained one is how two tasks end up running.
    */
-  private async runReconciliation(reason: string): Promise<void> {
-    if (!this.reconciliation) return;
+  /**
+   * What the live relay is holding, for the ledger to compare against.
+   *
+   * A reconciliation that cannot see the live state calls every unfinished
+   * task a orphan, including the one it is running right now.
+   */
+  private liveReconciliationContext(): ReconciliationLiveContext {
+    const snapshot = this.store.snapshot();
+
+    return {
+      pending: snapshot.pending.map((item) => item.taskId).filter((id): id is string => typeof id === "string"),
+      current: snapshot.currentTask?.taskId ?? null,
+    };
+  }
+
+  /**
+   * Closes one task the relay has forgotten, by an explicit operator decision.
+   *
+   * This is the deliberate alternative to asking a reconciliation for a
+   * resend: the chain shows that WorkBuddy ran the task, the live state no
+   * longer has it, and no result ever reached the relay - so the only safe
+   * answer is to record that a human closed the book on it.
+   *
+   * It enqueues nothing, requeues nothing, writes no completion the relay
+   * never observed, and leaves every other task exactly as it was. The old
+   * ledger rows are read, never rewritten.
+   */
+  async closeReconciledTaskWithoutResend(input: {
+    taskId: string;
+    reason: string;
+  }): Promise<{
+    ok: boolean;
+    message: string;
+    blocked: boolean;
+    findings: string[];
+  }> {
+    const taskId = input.taskId.trim();
+
+    if (taskId.length === 0) {
+      return {
+        ok: false,
+        message: "a historical close needs the task it closes",
+        blocked: this.reconciliationHold,
+        findings: [],
+      };
+    }
+
+    if (!this.reconciliation) {
+      return {
+        ok: false,
+        message: "the relay has no ledger, so there is nothing to close",
+        blocked: this.reconciliationHold,
+        findings: [],
+      };
+    }
+
+    const closed = await this.reconciliation.recordTaskClosedWithoutResend({
+      taskId,
+      reason: input.reason,
+      source: "control",
+    });
+
+    if (!closed.ok) {
+      return {
+        ok: false,
+        message: closed.message,
+        blocked: this.reconciliationHold,
+        findings: [],
+      };
+    }
+
+    this.noteLedgerWrite();
+
+    // The closure is written first; the chain is re-read with the live state
+    // so the answer describes the world, not the state before the decision.
+    const report = await this.runReconciliation(`closed without resend: ${input.reason}`);
+
+    if (report === null) {
+      return {
+        ok: true,
+        message: "the task was closed, but the ledger could not be re-read afterwards",
+        blocked: this.reconciliationHold,
+        findings: [],
+      };
+    }
+
+    const blocking = report.findings
+      .filter((finding) => finding.severity === "blocking")
+      .map((finding) => `${finding.kind}:${finding.taskId}`);
+
+    return {
+      ok: true,
+      message: report.blocked
+        ? `task ${taskId} was closed; other chains still block scheduling (${blocking.join(", ")})`
+        : `task ${taskId} was closed and scheduling is no longer held by it`,
+      blocked: report.blocked,
+      findings: blocking,
+    };
+  }
+
+  /**
+   * True when the relay itself is holding a task that needs a human.
+   *
+   * A task stopped without proof either way keeps scheduling frozen: whether
+   * WorkBuddy finished it is exactly what nobody can answer from the ledger,
+   * and "we no longer know" is not a green light for the next send.
+   */
+  private liveNeedsReconciliation(): boolean {
+    const stage = this.store.snapshot().currentTask?.execution?.stage;
+    return stage === "RECONCILIATION_REQUIRED";
+  }
+
+  /** Reads the ledger and reports on every task it knows about. */
+  private async runReconciliation(
+    reason: string,
+  ): Promise<ReconciliationReport | null> {
+    if (!this.reconciliation) return null;
 
     try {
-      const { report } = await this.reconciliation.reconcile(reason);
+      const { report } = await this.reconciliation.reconcile(reason, this.liveReconciliationContext());
       await this.reconciliation.recordReconciliationOutcome(report);
       this.noteLedgerWrite();
 
-      if (report.blocked) {
+      /*
+       * Two things freeze scheduling, and they are not the same thing. The
+       * ledger may hold a chain that cannot be explained; and the relay may
+       * be holding a task *it* stopped mid-flight, where no chain can say
+       * whether WorkBuddy finished it - reconciliation passing cleanly over
+       * that task is not a clearance, because the relay already said it does
+       * not know. A hold survives until a human resolves it either way.
+       */
+      const liveHold = this.liveNeedsReconciliation();
+
+      if (report.blocked || liveHold) {
         this.reconciliationHold = true;
         await this.audit.write("reconciliation_blocked", {
           reason,
@@ -1763,17 +1892,19 @@ export class ZhixingRelay {
           `[relay] reconciliation blocked automatic scheduling (${reason}): ` +
             `${report.findings.filter((f) => f.severity === "blocking").map((f) => f.kind).join(", ")}`,
         );
-        return;
+        return report;
       }
 
       console.log(
         `[relay] reconciliation clean (${reason}): ${report.tasksSeen} task(s) checked`,
       );
+      return report;
     } catch (error) {
       console.error(
         `[relay] reconciliation failed (${reason}): ` +
           `${error instanceof Error ? error.message : String(error)}`,
       );
+      return null;
     }
   }
 

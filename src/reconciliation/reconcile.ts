@@ -22,6 +22,8 @@ export type ReconciliationFindingKind =
   | "result_not_delivered"
   | "never_dispatched"
   | "orphaned_task"
+  // An operator closed this forgotten task instead of leaving it frozen.
+  | "historical_task_closed"
   | "result_task_id_mismatch"
   | "resend_allowed"
   | "matched";
@@ -65,6 +67,8 @@ export type TaskReconciliation = {
   evidence: ReconciliationEventName[];
   state: TaskState;
   findings: ReconciliationFinding[];
+  /** The ledger sequence of the operator closure, when one closes this task. */
+  closedAtSeq: number | null;
   /** Safe to send again only after a human has been told what the state is. */
   mayResend: boolean;
 };
@@ -123,16 +127,108 @@ function emptyReport(reason: string, corruptLines: number): ReconciliationReport
 }
 
 /**
+ * The evidence that WorkBuddy already has the task.
+ *
+ * Anything in this list turns a retry into a duplicate: the relay cannot
+ * prove the first send never ran, and a send that runs twice cannot be
+ * undone. A requeue row from an older release says only that somebody
+ * requeued - it is an error record, not proof either way - so it can never
+ * outweigh a row that proves the send happened.
+ */
+const PROVEN_SEND_EVIDENCE: readonly ReconciliationEventName[] = [
+  "SEND_CONFIRMED",
+  "RUNNING_CONFIRMED",
+  "RESULT_RECEIVED",
+  "RESULT_PERSISTED",
+  "RESULT_DELIVERED",
+  "RESULT_ACKED",
+  "TASK_COMPLETED",
+];
+
+export function hasProvenSend(evidence: readonly ReconciliationEventName[]): boolean {
+  return PROVEN_SEND_EVIDENCE.some((event) => evidence.includes(event));
+}
+
+/**
+ * The events that say the task started or answered again.
+ *
+ * A closure settles the *history* it was written about. It cannot settle a
+ * send that happens after it, so anything in this list that follows a
+ * closure is judged on its own terms.
+ */
+const EXECUTION_EVIDENCE: readonly ReconciliationEventName[] = [
+  "DISPATCH_STARTED",
+  "INPUT_CONFIRMED",
+  "SEND_CONFIRMED",
+  "RUNNING_CONFIRMED",
+  "RESULT_RECEIVED",
+  "RESULT_PERSISTED",
+  "RESULT_DELIVERED",
+  "RESULT_ACKED",
+  "TASK_COMPLETED",
+];
+
+/**
+ * The dispositions an operator may write to close a task for good.
+ *
+ * A closure is the only way a task the relay has forgotten stops being a
+ * blocker, and it has to name the kind of closure it is: "the work is done,
+ * never send it again" is a different human decision from "drop it", and the
+ * ledger keeps them apart on purpose.
+ */
+export type HistoricalDisposition = "close_without_resend";
+
+export const HISTORICAL_DISPOSITIONS: readonly HistoricalDisposition[] = ["close_without_resend"];
+
+/**
+ * Whether a ledger row is an operator closure.
+ *
+ * Read from the row's own detail rather than from the event name, because
+ * `RECONCILIATION_RESOLVED` already means something else - lifting the hold
+ * on a frozen live task - and the two decisions must not be interchangeable.
+ */
+export function isClosingDisposition(detail: unknown): boolean {
+  if (!detail || typeof detail !== "object") return false;
+  const value = (detail as { disposition?: unknown }).disposition;
+  return typeof value === "string" && (HISTORICAL_DISPOSITIONS as readonly string[]).includes(value);
+}
+
+/** The closure that closes this chain, or null when there is none. */
+function lastClosure(events: readonly ReconciliationEvent[]): ReconciliationEvent | null {
+  let latest: ReconciliationEvent | null = null;
+
+  for (const event of events) {
+    if (event.event !== "RECONCILIATION_RESOLVED") continue;
+    if (!isClosingDisposition(event.detail)) continue;
+    if (latest === null || event.seq > latest.seq) latest = event;
+  }
+
+  return latest;
+}
+
+/**
+ * What the live relay knows, so the ledger can tell a task it is still
+ * running from one it has lost.
+ */
+export type ReconciliationLiveContext = {
+  pending?: readonly string[];
+  current?: string | null;
+};
+
+/**
  * Reads one task's events.
  *
  * `context` carries what the live relay knows - the ids that are queued and
  * the one in flight - because the ledger can also hold tasks that the state
  * file has already forgotten, and a forgotten published task is precisely the
- * "漏发" case a human has to see.
+ * "漏发" case a human has to see. Without the live context every unfinished
+ * task in the ledger reads as orphaned, which is why the caller has to pass
+ * it: the ledger records what happened, the live state says what is true now,
+ * and only both together can answer the orphan question honestly.
  */
 export function reconcileTask(
   events: readonly ReconciliationEvent[],
-  context?: { pending?: readonly string[]; current?: string | null },
+  context?: ReconciliationLiveContext,
 ): TaskReconciliation {
   const taskId = events[0]?.taskId ?? "";
   const fingerprints = distinct(events.map((event) => event.taskFingerprint));
@@ -157,6 +253,18 @@ export function reconcileTask(
 
   const evidence = distinct(events.map((event) => event.event));
   const has = (name: ReconciliationEventName) => evidence.includes(name);
+
+  /*
+   * A closure is the only honest way out of "the ledger knows a task the
+   * relay does not": the human says what happened outside the relay, and the
+   * ledger records it. It is read here so the orphan question below can tell
+   * a forgotten task that was closed from one that was simply lost.
+   */
+  const closure = lastClosure(events);
+  const closedAtSeq = closure?.seq ?? null;
+  const afterClosure = closure === null ? [] : events.filter((event) => event.seq > closure.seq);
+  const ranAgainAfterClosure = afterClosure.some((event) => EXECUTION_EVIDENCE.includes(event.event));
+  const closedByOperator = closure !== null && !ranAgainAfterClosure;
 
   const findings: ReconciliationFinding[] = [];
 
@@ -296,16 +404,46 @@ export function reconcileTask(
   const inRelay = pending.includes(taskId) || inFlight === taskId;
 
   if (inRelay === false && state !== "completed" && state !== "blocked" && has("TASK_PUBLISHED")) {
-    findings.push({
-      kind: "orphaned_task",
-      severity: "blocking",
-      taskId,
-      dispatchId: null,
-      detail:
-        `task ${taskId} is in the ledger but no longer in the relay state ` +
-        `(not queued, not in flight); it has to be reconciled against GPT, not silently resent`,
-      events: ["TASK_PUBLISHED"],
-    });
+    /*
+     * Two different answers to the same question, and only a human can tell
+     * them apart:
+     *
+     *   lost        the ledger knows a task the relay does not, and nothing
+     *               says what became of it - blocking, and blocking is the
+     *               only safe answer because a lost task may be running now;
+     *   closed      an operator looked at the chain, saw that WorkBuddy
+     *               finished the work, and decided it will never be resent -
+     *               the orphan is settled, and the event is recorded rather
+     *               than the task, so the history stays readable.
+     *
+     * A closure never covers what happens after it: a send recorded after the
+     * closure is judged on its own, so a later abnormal execution cannot be
+     * hidden by an older decision.
+     */
+    if (closedByOperator) {
+      findings.push({
+        kind: "historical_task_closed",
+        severity: "info",
+        taskId,
+        dispatchId: null,
+        events: ["RECONCILIATION_RESOLVED"],
+        detail:
+          `task ${taskId} is not in the relay state, and an operator closed it at seq ${closedAtSeq} ` +
+          `without it being resent; the old orphan is settled, the task stays out of the queue, and ` +
+          `nothing after seq ${closedAtSeq} is covered by this decision`,
+      });
+    } else {
+      findings.push({
+        kind: "orphaned_task",
+        severity: "blocking",
+        taskId,
+        dispatchId: null,
+        detail:
+          `task ${taskId} is in the ledger but no longer in the relay state ` +
+          `(not queued, not in flight); it has to be reconciled against GPT, not silently resent`,
+        events: ["TASK_PUBLISHED"],
+      });
+    }
   }
 
   if (has("TASK_REQUEUED") && !has("RUNNING_CONFIRMED")) {
@@ -324,14 +462,13 @@ export function reconcileTask(
 
   /*
    * A retry once nothing confirmed the task ran is safe; a retry after that is
-   * a duplicate send, and that is never allowed.
+   * a duplicate send, and that is never allowed. The proof that beats a
+   * requeue is any evidence that WorkBuddy got the task, so the old requeue
+   * row from an earlier release cannot reopen a send that already happened -
+   * and a task an operator closed is not ours to send either.
    */
   const mayResend =
-    !blocking &&
-    has("TASK_REQUEUED") &&
-    !has("RUNNING_CONFIRMED") &&
-    !has("RESULT_RECEIVED") &&
-    !has("RESULT_ACKED");
+    !blocking && closure === null && has("TASK_REQUEUED") && !hasProvenSend(evidence);
 
   if (findings.length === 0) {
     findings.push({
@@ -354,6 +491,7 @@ export function reconcileTask(
     evidence,
     state,
     findings,
+    closedAtSeq,
     mayResend,
   };
 }

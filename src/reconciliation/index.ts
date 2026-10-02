@@ -1,11 +1,17 @@
-import { identityFingerprints } from "./fingerprint.js";
+import { identityFingerprints, UNKNOWN_FINGERPRINT } from "./fingerprint.js";
 import { TaskLedger } from "./ledger.js";
 import { reconcile } from "./reconcile.js";
+import type { ReconciliationLiveContext } from "./reconcile.js";
 import type {
   ReconciliationEvent,
   ReconciliationEventName,
   ReconciliationSource,
 } from "./types.js";
+
+/** The answer to "close this task for good". */
+export type CloseTaskResult =
+  | { ok: true; event: ReconciliationEvent }
+  | { ok: false; message: string };
 
 export { TaskLedger, defaultLedgerUrl } from "./ledger.js";
 export * from "./fingerprint.js";
@@ -194,6 +200,46 @@ export class ReconciliationService {
   }
 
   /**
+   * Closes one task the live state has forgotten.
+   *
+   * This is the operator half of reconciliation: the relay knows the task is
+   * gone from the state file, WorkBuddy ran it, and no result ever came back
+   * into the relay - so the human says "it is finished, never send it again"
+   * and that single decision is written against the task it names.
+   *
+   * What it deliberately does not do: delete or rewrite any earlier line,
+   * invent a `TASK_COMPLETED`, `RESULT_RECEIVED` or acknowledgement that
+   * never happened, put the task back on the queue, or touch any other task.
+   * The closure is a new row that explains the old one, which is the only
+   * form a decision may take in an append-only ledger.
+   */
+  async recordTaskClosedWithoutResend(input: {
+    taskId: string;
+    reason: string;
+    source?: ReconciliationSource;
+  }): Promise<CloseTaskResult> {
+    const taskId = input.taskId.trim();
+    if (taskId.length === 0) {
+      return { ok: false, message: "a historical close needs the task it closes" };
+    }
+
+    const event = await this.ledger.append({
+      event: "RECONCILIATION_RESOLVED",
+      taskId,
+      // Bookkeeping: the row closes a task, it does not name an envelope.
+      taskFingerprint: UNKNOWN_FINGERPRINT,
+      source: input.source ?? "control",
+      detail: {
+        disposition: "close_without_resend",
+        reason: input.reason,
+        taskId,
+      },
+    });
+
+    return { ok: true, event };
+  }
+
+  /**
    * The end of a hold, recorded rather than edited.
    *
    * A hold is lifted by a NEW event saying why the chain is now explainable,
@@ -230,13 +276,28 @@ export class ReconciliationService {
     return this.ledger.history(taskId);
   }
 
-  /** Reads the ledger and reports on every task it knows about. */
-  async reconcile(reason: string): Promise<{
+  /**
+   * Reads the ledger and reports on every task it knows about.
+   *
+   * `context` is what the live relay is holding right now. It is not optional
+   * decoration: without it every unfinished task in the ledger - including the
+   * one being run this very second - reads as orphaned and freezes scheduling,
+   * so the caller passes the queue and the task in flight as they are.
+   */
+  async reconcile(
+    reason: string,
+    context?: ReconciliationLiveContext,
+  ): Promise<{
     report: import("./reconcile.js").ReconciliationReport;
     corruptLines: number;
   }> {
     const { events, corruptLines } = await this.ledger.list();
-    const report = reconcile(events, { reason, corruptLines });
+    const report = reconcile(events, {
+      reason,
+      corruptLines,
+      pending: context?.pending ?? [],
+      current: context?.current ?? null,
+    });
 
     return { report, corruptLines };
   }

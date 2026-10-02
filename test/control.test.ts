@@ -8,7 +8,7 @@
  * with fetch, which is exactly what an operator would do.
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -26,10 +26,17 @@ import type { AuditLog } from "../src/audit.js";
 import { ZhixingRelay } from "../src/relay.js";
 import { RelayStore } from "../src/store.js";
 import type { WorkBuddyClient } from "../src/workbuddy.js";
+import { TaskLedger } from "../src/reconciliation/index.js";
 
 const SECRET = "relay-secret-from-env";
 
+/** The chain this file's close tests reconcile: WorkBuddy ran it, the relay lost it. */
+const CLOSED_TASK = "relay-reliable-ack-v047-001";
+const CLOSED_HASH = "a".repeat(64);
+
 let sandboxRoot = "";
+/** The ledger of the relay this case is driving, so a test can read it back. */
+let ledgerFile = "";
 let store: RelayStore;
 let inner: ZhixingRelay;
 let server: ControlServer;
@@ -46,6 +53,12 @@ let control: {
   resume: () => Promise<void>;
   requestRestart: (reason: string) => Promise<{ ok: boolean; message: string }>;
   emitHeartbeat: () => string;
+  closeTaskWithoutResend: (input: { taskId: string; reason: string }) => Promise<{
+    ok: boolean;
+    message: string;
+    blocked: boolean;
+    findings: string[];
+  }>;
 };
 
 function fakeAudit(): AuditLog {
@@ -102,8 +115,10 @@ beforeEach(async () => {
   store = new RelayStore(pathToFileURL(join(dir, "state.json")));
   await store.load();
 
+  ledgerFile = join(dir, "ledger.jsonl");
+
   const made = new ZhixingRelay(
-    { relay: {} } as unknown as AppConfig,
+    { relay: {}, paths: { ledger: pathToFileURL(ledgerFile) } } as unknown as AppConfig,
     fakeBridge(),
     store,
     fakeAudit(),
@@ -135,6 +150,10 @@ beforeEach(async () => {
     emitHeartbeat: () => {
       calls.push("heartbeat");
       return inner.emitHeartbeat();
+    },
+    closeTaskWithoutResend: (input) => {
+      calls.push(`close:${input.taskId}`);
+      return inner.closeReconciledTaskWithoutResend(input);
     },
   };
 
@@ -291,5 +310,110 @@ describe("control routes", () => {
     await post("/control/resume", { [SECRET_HEADER]: "wrong" });
 
     expect(calls).toEqual([]);
+  });
+});
+
+/*
+ * The historical close: the way a human tells the relay "WorkBuddy already
+ * ran this one, stop freezing on it". Every test here goes through the same
+ * HTTP surface an operator has, at the same relay method the CLI would call.
+ */
+describe("closing a task the relay has forgotten", () => {
+  /** The chain: published, dispatched, proved sent, requeued by an older release. */
+  async function seedForgottenTask(): Promise<TaskLedger> {
+    const log = new TaskLedger(pathToFileURL(ledgerFile));
+
+    await log.append({ event: "TASK_PUBLISHED", taskId: CLOSED_TASK, taskFingerprint: CLOSED_HASH, source: "gpt" });
+    await log.append({
+      event: "DISPATCH_STARTED",
+      taskId: CLOSED_TASK,
+      taskFingerprint: CLOSED_HASH,
+      dispatchId: `${CLOSED_TASK}#0`,
+      attempt: 0,
+      source: "relay",
+    });
+    await log.append({
+      event: "SEND_CONFIRMED",
+      taskId: CLOSED_TASK,
+      taskFingerprint: CLOSED_HASH,
+      dispatchId: `${CLOSED_TASK}#0`,
+      attempt: 0,
+      source: "relay",
+    });
+    await log.append({ event: "TASK_REQUEUED", taskId: CLOSED_TASK, taskFingerprint: "*", source: "relay" });
+
+    return log;
+  }
+
+  async function ledgerEvents(): Promise<Record<string, unknown>[]> {
+    const raw = await readFile(ledgerFile, "utf8").catch(() => "");
+    return raw
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  it("refuses a close that does not name the task it closes", async () => {
+    await seedForgottenTask();
+
+    const { status, body } = await post(
+      "/control/reconciliation/close?disposition=close_without_resend&reason=done",
+    );
+
+    expect(status).toBe(409);
+    expect(body.ok).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it("refuses a close that is not a decision about a resend", async () => {
+    await seedForgottenTask();
+
+    const { status } = await post(
+      `/control/reconciliation/close?taskId=${CLOSED_TASK}&disposition=drop_it`,
+    );
+
+    expect(status).toBe(400);
+    expect(calls).toEqual([]);
+  });
+
+  it("closes the chain by adding one row, and enqueues nothing", async () => {
+    await seedForgottenTask();
+    const beforeClose = await ledgerEvents();
+
+    const { status, body } = await post(
+      `/control/reconciliation/close?taskId=${CLOSED_TASK}&disposition=close_without_resend` +
+        `&reason=WorkBuddy%20finished%20the%20work`,
+    );
+
+    expect(status).toBe(200);
+    expect(body.ok).toBe(true);
+
+    const rows = await ledgerEvents();
+    // The closure, and the outcome row the pass that follows it files about it.
+    expect(rows).toHaveLength(beforeClose.length + 2);
+
+    const closure = rows[rows.length - 2] as Record<string, unknown>;
+    expect(closure.event).toBe("RECONCILIATION_RESOLVED");
+    expect(closure.taskId).toBe(CLOSED_TASK);
+    // Bookkeeping: the row closes a task, it names no envelope.
+    expect(closure.taskFingerprint).toBe("*");
+    expect(closure.detail).toMatchObject({
+      disposition: "close_without_resend",
+      taskId: CLOSED_TASK,
+    });
+
+    // Nothing else moved: no second dispatch, no invented completion.
+    expect(rows.filter((row) => row.event === "DISPATCH_STARTED")).toHaveLength(1);
+    expect(rows.filter((row) => row.event === "TASK_COMPLETED")).toHaveLength(0);
+    expect(rows.filter((row) => row.event === "TASK_REQUEUED")).toHaveLength(1);
+
+    /*
+     * Nothing was queued, nothing was completed by invention, and the relay
+     * still knows nothing of the task: a close is a decision about the
+     * ledger, never a reason to send again.
+     */
+    expect(inner.status().pending).toEqual([]);
+    expect(inner.status().currentTask).toBeNull();
+    expect(calls).toEqual([`close:${CLOSED_TASK}`]);
   });
 });

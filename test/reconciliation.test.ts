@@ -638,6 +638,248 @@ describe("a contradiction that is real", () => {
     })).toMatchObject({ kind: "blocked", reason: "identity_conflict" });
   });
 });
+/*
+ * The last piece of the semantics: the ledger can hold a task the live state
+ * has forgotten. Three answers have to stay apart - the relay still running
+ * it, the task lost, and the task a human closed - and only the middle one
+ * may freeze scheduling.
+ */
+describe("a task the relay has forgotten", () => {
+  const OTHER_TASK = "relay-reliable-ack-v047-002";
+  const OTHER_HASH = "1".repeat(64);
+
+  /** The accident chain, seeded through the ledger itself, not as an array. */
+  async function seedAccident(name: string): Promise<{ log: TaskLedger; service: ReconciliationService }> {
+    const log = ledger(name);
+    const service = new ReconciliationService(log);
+
+    for (const event of incidentLedger()) {
+      await log.append({
+        event: event.event,
+        taskId: event.taskId,
+        taskFingerprint: event.taskFingerprint,
+        dispatchId: event.dispatchId,
+        attempt: event.attempt,
+        source: event.source,
+      });
+    }
+
+    return { log, service };
+  }
+
+  /*
+   * Before any decision: the chain the accident left behind. It blocks - the
+   * relay forgot the task - but it never offers a resend, because WorkBuddy
+   * proved it got the send and an old requeue row cannot say otherwise.
+   */
+  it("blocks on the orphan, and never offers a resend the send was proven for", async () => {
+    const { service } = await seedAccident("forgotten-before.jsonl");
+
+    const { report } = await service.reconcile("startup", { pending: [], current: null });
+
+    expect(report.findings.filter((finding) => finding.severity === "blocking").map((f) => f.kind)).toEqual([
+      "orphaned_task",
+    ]);
+    expect(report.blocked).toBe(true);
+    expect(report.resendAllowed).toBe(false);
+    expect(report.tasks.find((task) => task.taskId === INCIDENT_TASK)?.mayResend).toBe(false);
+    expect(report.findings.some((finding) => finding.kind === "identity_conflict")).toBe(false);
+  });
+
+  /*
+   * The live context is what tells "the relay is running it" from "the relay
+   * lost it". Without it every unfinished task in the ledger - including the
+   * one running this second - reads as orphaned.
+   */
+  it("does not orphan a task the relay is running or still has queued", async () => {
+    const { service } = await seedAccident("forgotten-live.jsonl");
+
+    const running = await service.reconcile("startup", { pending: [], current: INCIDENT_TASK });
+    expect(running.report.blocked).toBe(false);
+    expect(running.report.findings.some((finding) => finding.kind === "orphaned_task")).toBe(false);
+
+    const queued = await service.reconcile("startup", { pending: [INCIDENT_TASK], current: null });
+    expect(queued.report.blocked).toBe(false);
+    expect(queued.report.findings.some((finding) => finding.kind === "orphaned_task")).toBe(false);
+
+    // ... and the very same chain is an orphan once the relay has forgotten it.
+    const forgotten = await service.reconcile("startup", { pending: [], current: null });
+    expect(forgotten.report.blocked).toBe(true);
+    expect(forgotten.report.findings.some((finding) => finding.kind === "orphaned_task")).toBe(true);
+  });
+
+  /*
+   * The accident, closed the only honest way: a human says WorkBuddy finished
+   * the work and it will never be resent. The task is not enqueued, not
+   * requeued, and no completion the relay never saw is written in its place.
+   */
+  it("closes the orphan without sending, requeueing or rewriting anything", async () => {
+    const { log, service } = await seedAccident("forgotten-closed.jsonl");
+    const linesBefore = (await log.list()).events.length;
+
+    const closed = await service.recordTaskClosedWithoutResend({
+      taskId: INCIDENT_TASK,
+      reason: "WorkBuddy finished the work; the result never reached the relay",
+    });
+
+    expect(closed.ok).toBe(true);
+    if (!closed.ok) return;
+    expect(closed.event.event).toBe("RECONCILIATION_RESOLVED");
+    // Task-scoped: it names the task it closes, and carries no envelope.
+    expect(closed.event.taskId).toBe(INCIDENT_TASK);
+    expect(closed.event.taskFingerprint).toBe("*");
+    expect(closed.event.detail).toMatchObject({ disposition: "close_without_resend" });
+
+    const { report } = await service.reconcile("after close", { pending: [], current: null });
+
+    expect(report.blocked).toBe(false);
+    expect(report.findings.some((finding) => finding.kind === "orphaned_task")).toBe(false);
+    expect(report.findings.some((finding) => finding.kind === "historical_task_closed")).toBe(true);
+    expect(report.resendAllowed).toBe(false);
+    expect(report.tasks.find((task) => task.taskId === INCIDENT_TASK)?.mayResend).toBe(false);
+    expect(report.tasks.find((task) => task.taskId === INCIDENT_TASK)?.closedAtSeq).toBe(closed.event.seq);
+
+    /*
+     * One row was added and nothing else: no second dispatch, no completion,
+     * no correction of the chain the relay already recorded.
+     */
+    const { events: rows } = await log.list();
+    expect(rows).toHaveLength(linesBefore + 1);
+    expect(rows.filter((row) => row.event === "DISPATCH_STARTED")).toHaveLength(1);
+    expect(rows.filter((row) => row.event === "TASK_COMPLETED")).toHaveLength(0);
+  });
+
+  it("refuses a close that does not name a task", async () => {
+    const { service } = await seedAccident("forgotten-no-task.jsonl");
+
+    expect(await service.recordTaskClosedWithoutResend({ taskId: "   ", reason: "why" })).toMatchObject({
+      ok: false,
+    });
+    expect(
+      (await service.reconcile("after close", { pending: [], current: null })).report.blocked,
+    ).toBe(true);
+  });
+
+  /*
+   * A restart reads the same file again. The closure has to survive it, or the
+   * next start-up would re-freeze on a task a human already settled.
+   */
+  it("stays closed after a restart that re-reads the ledger from disk", async () => {
+    const { service } = await seedAccident("forgotten-restart.jsonl");
+
+    await service.recordTaskClosedWithoutResend({ taskId: INCIDENT_TASK, reason: "already done" });
+
+    // A new process: the same file, the same answer.
+    const restarted = new ReconciliationService(ledger("forgotten-restart.jsonl"));
+    const { report } = await restarted.reconcile("startup after restart", { pending: [], current: null });
+
+    expect(report.blocked).toBe(false);
+    expect(report.findings.some((finding) => finding.kind === "orphaned_task")).toBe(false);
+    expect(report.tasks.find((task) => task.taskId === INCIDENT_TASK)?.closedAtSeq).not.toBeNull();
+  });
+
+  /*
+   * A close that cleared *everything* would be a global reset wearing an
+   * operator's authority, so it closes the task it names and nothing more.
+   */
+  it("closes only the task it names: another forgotten task stays blocked", async () => {
+    const log = ledger("forgotten-multi.jsonl");
+
+    for (const event of incidentLedger()) {
+      await log.append({
+        event: event.event,
+        taskId: event.taskId,
+        taskFingerprint: event.taskFingerprint,
+        dispatchId: event.dispatchId,
+        attempt: event.attempt,
+        source: event.source,
+      });
+    }
+    await log.append({
+      event: "TASK_PUBLISHED",
+      taskId: OTHER_TASK,
+      taskFingerprint: OTHER_HASH,
+      source: "gpt",
+    });
+    await log.append({
+      event: "DISPATCH_STARTED",
+      taskId: OTHER_TASK,
+      taskFingerprint: OTHER_HASH,
+      dispatchId: `${OTHER_TASK}#0`,
+      attempt: 0,
+      source: "relay",
+    });
+
+    const service = new ReconciliationService(log);
+    await service.recordTaskClosedWithoutResend({ taskId: INCIDENT_TASK, reason: "already done" });
+
+    const { report } = await service.reconcile("after close", { pending: [], current: null });
+
+    // Three chains: the accident, the other lost task, and the placeholder row.
+    expect(report.tasksSeen).toBe(3);
+    expect(report.blocked).toBe(true);
+    expect(
+      report.findings
+        .filter((finding) => finding.severity === "blocking")
+        .map((finding) => `${finding.kind}:${finding.taskId}`),
+    ).toEqual([`orphaned_task:${OTHER_TASK}`]);
+    expect(report.findings.some((finding) => finding.kind === "historical_task_closed" && finding.taskId === INCIDENT_TASK)).toBe(true);
+    expect(report.tasks.find((task) => task.taskId === OTHER_TASK)?.closedAtSeq).toBeNull();
+  });
+
+  /*
+   * A decision cannot cover what happens after it. When the chain grows a new
+   * send, that send is judged on its own and the old orphan comes back.
+   */
+  it("does not let a closure cover a later send", async () => {
+    const { log, service } = await seedAccident("forgotten-boundary.jsonl");
+
+    const closed = await service.recordTaskClosedWithoutResend({ taskId: INCIDENT_TASK, reason: "already done" });
+    if (!closed.ok) throw new Error("the closure was not written");
+
+    // A later send, written the way any later execution record would be: an
+    // appended row, never a correction of the chain already on disk.
+    await log.append({
+      event: "DISPATCH_STARTED",
+      taskId: INCIDENT_TASK,
+      taskFingerprint: INCIDENT_HASH,
+      dispatchId: `${INCIDENT_TASK}#1`,
+      attempt: 1,
+      source: "relay",
+      detail: { reason: "requeued after the closure was written" },
+    });
+
+    const { report } = await service.reconcile("after a later send", { pending: [], current: null });
+
+    expect(report.blocked).toBe(true);
+    expect(report.findings.filter((finding) => finding.severity === "blocking").map((f) => f.kind)).toEqual([
+      "orphaned_task",
+    ]);
+    expect(report.findings.some((finding) => finding.kind === "historical_task_closed")).toBe(false);
+    expect(report.tasks.find((task) => task.taskId === INCIDENT_TASK)?.closedAtSeq).toBe(closed.event.seq);
+  });
+
+  /*
+   * The pair that keeps the rule honest: a proven send refuses a resend, but
+   * a chain with no send evidence at all still gets one - otherwise the rule
+   * would have become "never resend" and the requeue path would be dead.
+   */
+  it("offers a resend only while nothing proves WorkBuddy got the task", () => {
+    const proven = reconcile(incidentLedger(), { reason: "manual", pending: [], current: INCIDENT_TASK });
+
+    expect(proven.tasks.find((task) => task.taskId === INCIDENT_TASK)?.mayResend).toBe(false);
+    expect(proven.resendAllowed).toBe(false);
+
+    const unproven = reconcile(
+      incidentLedger().filter((event) => event.event !== "SEND_CONFIRMED"),
+      { reason: "manual", pending: [], current: INCIDENT_TASK },
+    );
+
+    expect(unproven.tasks.find((task) => task.taskId === INCIDENT_TASK)?.mayResend).toBe(true);
+    expect(unproven.resendAllowed).toBe(true);
+  });
+});
+
 describe("reconciliation service", () => {
   it("blocks a task id that arrives under a second envelope, and records why", async () => {
     const log = ledger("service-conflict.jsonl");

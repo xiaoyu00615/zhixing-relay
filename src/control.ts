@@ -38,6 +38,18 @@ export type RuntimeControl = {
    * reconciliation could be resolved with from the console.
    */
   resolveReconciliation?: (reason: string) => Promise<{ ok: boolean; message: string }>;
+  /**
+   * Closes one task the relay has forgotten, without ever sending it again.
+   *
+   * Distinct from the line above on purpose: resolving a hold is a statement
+   * about the task *being run* - the requeue path puts it back on the queue -
+   * while a historical close is a statement about a task the live state has
+   * already lost, and it must never requeue anything.
+   */
+  closeTaskWithoutResend?: (input: {
+    taskId: string;
+    reason: string;
+  }) => Promise<{ ok: boolean; message: string; blocked: boolean; findings: string[] }>;
 };
 
 export const CONTROL_HOST = "127.0.0.1";
@@ -190,6 +202,47 @@ function routeFor(
         }
 
         const result = await control.resolveReconciliation(reason);
+        sendJson(res, result.ok ? 200 : 409, result);
+      };
+
+    /*
+     * The historical close, kept apart from the hold resolution above: it is
+     * the way an operator tells the relay "WorkBuddy already ran this one,
+     * stop freezing on it". The task id is mandatory, because a close that
+     * names nothing would close whatever happens to be in the way.
+     */
+    case "/control/reconciliation/close":
+      return async (_req, res) => {
+        const url = new URL(_req.url ?? "/", `http://${CONTROL_HOST}`);
+        const taskId = (url.searchParams.get("taskId") ?? "").trim();
+        const disposition = url.searchParams.get("disposition");
+        const reason = url.searchParams.get("reason") ?? "control channel";
+
+        if (typeof control.closeTaskWithoutResend !== "function") {
+          sendJson(res, 501, {
+            ok: false,
+            error: "reconciliation is not available on this relay",
+          });
+          return;
+        }
+
+        if (taskId.length === 0) {
+          sendJson(res, 409, {
+            ok: false,
+            error: "a historical close needs the task it closes (taskId is required)",
+          });
+          return;
+        }
+
+        if (disposition !== "close_without_resend") {
+          sendJson(res, 400, {
+            ok: false,
+            error: `disposition must be close_without_resend, got ${JSON.stringify(disposition)}`,
+          });
+          return;
+        }
+
+        const result = await control.closeTaskWithoutResend({ taskId, reason });
         sendJson(res, result.ok ? 200 : 409, result);
       };
 
