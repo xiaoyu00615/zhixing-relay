@@ -12,6 +12,10 @@
  * A turn count that grew is not a send. These cases replay the real order of
  * nodes after the click and hold the detector to the rule that only a
  * user-authored outbound turn can prove a send.
+ *
+ * The snapshots here carry every classified node - user, assistant and unknown
+ * - which is what the adapter really hands over: the page classifies and
+ * deletes nothing, and `confirmSend` is the only voter.
  */
 
 import { describe, expect, it } from "vitest";

@@ -11,7 +11,7 @@ import {
   type WorkBuddyState,
   type WorkBuddyTurnSignals,
 } from "./turn-state.js";
-import { type TurnSnapshot } from "./turn-ack.js";
+import { type ObservedTurn, type TurnRole, type TurnSnapshot } from "./turn-ack.js";
 import { CLASSIFY_TURN_NODE_SOURCE } from "./turn-roles.js";
 
 export type { WorkBuddyState } from "./turn-state.js";
@@ -128,8 +128,11 @@ function asString(value: unknown): string {
  * `new_turn_wrong_task` for a send that had in fact gone out, and the task
  * went to reconciliation with a false failure.
  *
- * So a container is classified here, and `turns` carries the outbound ones
- * only. The classification uses the two measured facts the relay already
+ * So every container is classified here, and `turns` carries all of them -
+ * classified, not filtered. The page reports what it saw; which of those
+ * nodes may vote for a send is the verdict layer's decision alone, and a node
+ * the page discarded would be a node the relay can never explain having
+ * ignored. The classification uses the measured facts the relay already
  * trusts, in this order:
  *
  *   1. user-authored content (`.cr-self-message__content`, measured on the
@@ -190,8 +193,8 @@ export const TURN_SNAPSHOT_EXPRESSION = (request: {
       return {
         signature: signature,
         role: role,
-        // Identity, kept on every node: only the outbound turns leave the
-        // page, but each of them still has to prove which task it carries.
+        // Identity, kept on every node: whichever of them the verdict layer
+        // listens to still has to prove which task it carries.
         containsTaskId: text.indexOf(taskId) !== -1,
         index: index,
       };
@@ -200,12 +203,63 @@ export const TURN_SNAPSHOT_EXPRESSION = (request: {
     return JSON.stringify({
       inputText: String(input ? (input.innerText || '') : ''),
       turnCount: observed.length,
-      // The outbound turns, and only those: everything else is filtered out
-      // in the page, so no verdict downstream can mistake a status row for
-      // the relay's message going out.
-      turns: observed.filter((turn) => turn.role === 'user'),
+      // Every classified node, in page order. Nothing is deleted here: a
+      // status card the page had dropped would be a status card the relay
+      // could not report having waited out.
+      turns: observed,
     });
   })()`;
+
+const TURN_ROLES: readonly TurnRole[] = ["user", "assistant", "unknown"];
+
+/**
+ * Turns the page's answer into the snapshot the verdict layer judges.
+ *
+ * The page is a browser and the payload crosses a debugger connection, so
+ * nothing here trusts its shape. A node with no signature cannot be told
+ * apart between two polls and is dropped; a node whose role is not one the
+ * classifier emits becomes `unknown`, because an unclassified node must
+ * never be able to vote by accident.
+ */
+export function parseTurnSnapshot(raw: unknown): TurnSnapshot {
+  if (typeof raw !== "string") return emptyTurnSnapshot();
+
+  try {
+    const payload = JSON.parse(raw) as {
+      inputText?: unknown;
+      turnCount?: unknown;
+      turns?: unknown;
+    };
+
+    const turns = Array.isArray(payload.turns) ? payload.turns : [];
+    const parsed: ObservedTurn[] = [];
+
+    for (const turn of turns) {
+      if (typeof turn !== "object" || turn === null) continue;
+
+      const candidate = turn as {
+        signature?: unknown;
+        role?: unknown;
+        containsTaskId?: unknown;
+      };
+
+      if (typeof candidate.signature !== "string") continue;
+
+      parsed.push({
+        signature: candidate.signature,
+        role: TURN_ROLES.includes(candidate.role as TurnRole) ? (candidate.role as TurnRole) : "unknown",
+        containsTaskId: candidate.containsTaskId === true,
+      });
+    }
+
+    return {
+      inputText: typeof payload.inputText === "string" ? payload.inputText : "",
+      turns: parsed,
+    };
+  } catch {
+    return emptyTurnSnapshot();
+  }
+}
 
 /** A snapshot with nothing rendered yet, so callers never see a missing page. */
 export function emptyTurnSnapshot(): TurnSnapshot {
@@ -344,11 +398,17 @@ export class WorkBuddyClient {
   }
 
   /**
-   * What the page renders right now: the outbound turns, and what each carries.
+   * What the page renders right now: every classified turn, and what each
+   * carries.
    *
    * Both facts it compares against come from the caller - the task id and the
    * outbound payload - because the page cannot say which node is the relay's
    * message; the relay already proved that one when it read the composer back.
+   *
+   * Nothing is filtered by role here. The page classifies, this returns what
+   * the page said, and `confirmSend` decides - which is also what makes the
+   * ignored nodes visible in the answer instead of gone before anyone could
+   * look at them.
    */
   async readTurnSnapshot(request: {
     taskId: string;
@@ -363,34 +423,7 @@ export class WorkBuddyClient {
         }),
       );
 
-    if (typeof raw !== "string") return emptyTurnSnapshot();
-
-    try {
-      const payload = JSON.parse(raw) as {
-        inputText?: unknown;
-        turnCount?: unknown;
-        turns?: unknown;
-      };
-
-      const turns = Array.isArray(payload.turns) ? payload.turns : [];
-
-      return {
-        inputText: typeof payload.inputText === "string" ? payload.inputText : "",
-        turns: turns.filter(
-          (turn): turn is TurnSnapshot["turns"][number] =>
-            typeof turn === "object" &&
-            turn !== null &&
-            typeof (turn as { signature?: unknown }).signature === "string" &&
-            /*
-             * Second line of defence, and the same rule the pure layer
-             * applies: no role, no vote.
-             */
-            (turn as { role?: unknown }).role === "user",
-        ),
-      };
-    } catch {
-      return emptyTurnSnapshot();
-    }
+    return parseTurnSnapshot(raw);
   }
 
   /**

@@ -47,11 +47,14 @@ export type TurnSnapshot = {
   /** What the composer still holds. Empty means it was cleared by a send. */
   inputText: string;
   /**
-   * The outbound turns, and only those.
+   * Every rendered turn the page could classify, in page order.
    *
-   * Everything that is not a user-authored turn is filtered out here, in the
-   * page, so the rest of the module can never have to ask "is this node a
-   * status row?" - the answer is already `false` by the time it gets here.
+   * The adapter's job is the classification, not the verdict: assistant
+   * chrome and unidentified nodes stay in the set and are reported as
+   * evidence, and `confirmSend` is the only place that decides which of
+   * them may vote. Filtering them out in the page would make the "seen and
+   * ignored" half of the answer unreachable - the relay could no longer
+   * say why a click produced no verdict.
    */
   turns: ObservedTurn[];
 };
@@ -76,7 +79,7 @@ export type SendConfirmation = {
   reason: "confirmed" | "no_new_turn" | "new_turn_wrong_task" | "input_not_confirmed" | "timeout";
   /** Identity of the new turn, when one was observed. */
   observedMessageId: string | null;
-  /** How many outbound turns the page had before and after the click. */
+  /** How many turns the page rendered before and after the click, all roles. */
   beforeTurnCount: number;
   afterTurnCount: number;
   /** Non-outbound nodes seen after the click, as evidence of what was ignored. */
@@ -183,6 +186,10 @@ export function outboundPayloadPrefix(text: string, length = OUTBOUND_PREFIX_LEN
  * A new user turn that carries a different task means the page moved on on its
  * own, and no new user turn at all means the send is in an unknown state -
  * which is a reconciliation case, never an implicit success.
+ *
+ * This is the only place that votes. The snapshot carries every classified
+ * node, including the assistant-side ones, precisely so that this function -
+ * not the page - decides which of them is allowed to speak for the send.
  */
 export function confirmSend(input: {
   before: TurnSnapshot;
@@ -211,7 +218,7 @@ export function confirmSend(input: {
       afterTurnCount: after.length,
       ignoredRoles,
       detail:
-        `the page rendered ${after.length} outbound turn(s) after the click and none of them is new, ` +
+        `the page rendered ${after.length} turn(s) after the click and none of them is a new outbound turn, ` +
         (ignoredRoles.length > 0
           ? `${ignoredRoles.length} non-outbound node(s) were seen and ignored (${ignoredRoles.join(", ")}), ` +
             `so whether the task was sent is unknown`
