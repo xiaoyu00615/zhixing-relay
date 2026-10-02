@@ -1,3 +1,4 @@
+import { identityFingerprints } from "./fingerprint.js";
 import { TaskLedger } from "./ledger.js";
 import { reconcile } from "./reconcile.js";
 import type {
@@ -40,7 +41,13 @@ export class ReconciliationService {
     const source = input.source ?? "gpt";
     const history = await this.ledger.history(input.taskId);
 
-    const prior = [...new Set(history.map((event) => event.taskFingerprint))];
+    /*
+     * Only rows that name a task can collide with this one. A ledger that
+     * already holds bookkeeping under the placeholder - which is what an older
+     * requeue or a resolution wrote - is not a second envelope, so publishing
+     * the real work underneath it is the normal thing, not a contradiction.
+     */
+    const prior = identityFingerprints(history.map((event) => event.taskFingerprint));
     const conflict = prior.find((fingerprint) => fingerprint !== input.taskFingerprint);
 
     if (conflict) {
@@ -193,6 +200,11 @@ export class ReconciliationService {
    * never by rewriting or deleting what the ledger already says. That is the
    * only way an operator can lift a freeze without erasing the evidence of the
    * mistake that froze it.
+   *
+   * With no task to point at it writes the placeholder, which is honest: the
+   * resolution belongs to every task the hold froze, not to one of them. The
+   * placeholder is bookkeeping, so it never counts as a task identity and its
+   * presence cannot produce an identity conflict.
    */
   async recordReconciliationResolved(input: {
     taskId?: string | null;

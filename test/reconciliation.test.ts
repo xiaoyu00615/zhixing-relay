@@ -7,6 +7,8 @@ import {
   TaskLedger,
   decideDispatch,
   dispatchIdFor,
+  identityFingerprints,
+  isConcreteTaskFingerprint,
   reconcile,
   taskFingerprint,
 } from "../src/reconciliation/index.js";
@@ -382,6 +384,260 @@ describe("reconcile", () => {
   });
 });
 
+/*
+ * The ledger the relay really produced during the two hour incident: one
+ * envelope, a dispatch, a send confirmation, and then the requeue and the
+ * startup block written without an envelope to point at. The last two carry
+ * the placeholder fingerprint on purpose - that is what the writers had to
+ * write when they could not name the task - and on this chain they are what
+ * made reconciliation report a contradiction that never existed.
+ */
+const INCIDENT_TASK = "relay-reliable-ack-v047-001";
+const INCIDENT_ENVELOPE =
+  "[ZHIXING_RELAY]\nTYPE: TASK\nTASK_ID: relay-reliable-ack-v047-001\n\nfreeze the chain and say what you saw\n[ZHIXING_RELAY_END]";
+const INCIDENT_HASH = taskFingerprint(INCIDENT_ENVELOPE);
+
+function incidentLedger(): ReconciliationEvent[] {
+  const at = "2026-10-02T00:00:00.000Z";
+  const row = (
+    seq: number,
+    event: ReconciliationEvent["event"],
+    taskId: string,
+    taskFingerprint: string,
+    extra: Partial<ReconciliationEvent> = {},
+  ): ReconciliationEvent => ({
+    seq,
+    at,
+    event,
+    taskId,
+    taskFingerprint,
+    dispatchId: null,
+    attempt: null,
+    source: "relay",
+    executor: null,
+    model: null,
+    messageFingerprint: null,
+    workbuddyMessageId: null,
+    detail: null,
+    ...extra,
+  });
+
+  return [
+    row(1, "RECONCILIATION_MATCHED", "*", "*"),
+    row(2, "TASK_PUBLISHED", INCIDENT_TASK, INCIDENT_HASH, { source: "gpt" }),
+    row(3, "DISPATCH_STARTED", INCIDENT_TASK, INCIDENT_HASH, {
+      dispatchId: `${INCIDENT_TASK}#0`,
+      attempt: 0,
+    }),
+    row(4, "SEND_CONFIRMED", INCIDENT_TASK, INCIDENT_HASH, {
+      dispatchId: `${INCIDENT_TASK}#0`,
+      attempt: 0,
+    }),
+    row(5, "TASK_REQUEUED", INCIDENT_TASK, "*", {
+      detail: { retryCount: 1, reason: "Timed out waiting WorkBuddy after 7200000ms" },
+    }),
+    row(6, "RECONCILIATION_BLOCKED", INCIDENT_TASK, "*"),
+  ];
+}
+
+describe("fingerprints that name nothing", () => {
+  it("recognises a placeholder as bookkeeping and a hash as identity", () => {
+    expect(isConcreteTaskFingerprint("*")).toBe(false);
+    expect(isConcreteTaskFingerprint("")).toBe(false);
+    expect(isConcreteTaskFingerprint(null)).toBe(false);
+    expect(isConcreteTaskFingerprint(undefined)).toBe(false);
+    expect(isConcreteTaskFingerprint(INCIDENT_HASH)).toBe(true);
+  });
+
+  it("counts identity, not rows", () => {
+    expect(identityFingerprints([INCIDENT_HASH, INCIDENT_HASH, "*", "*", null, ""])).toEqual([
+      INCIDENT_HASH,
+    ]);
+    expect(identityFingerprints(["*", "*"])).toEqual([]);
+    expect(identityFingerprints([INCIDENT_HASH, "other", "*"])).toHaveLength(2);
+  });
+});
+
+describe("the incident ledger", () => {
+  it("reads one identity out of a chain that mentions a task and its bookkeeping", () => {
+    const report = reconcile(incidentLedger(), { reason: "startup", current: INCIDENT_TASK, pending: [] });
+
+    const task = report.tasks.find((item) => item.taskId === INCIDENT_TASK);
+    expect(task?.identities).toEqual([INCIDENT_HASH]);
+    expect(task?.fingerprints).toEqual([INCIDENT_HASH, "*"]);
+    expect(report.findings.some((finding) => finding.kind === "identity_conflict")).toBe(false);
+  });
+
+  /*
+   * The assertion that matters: while the relay still knows the task, the
+   * chain the accident left behind is not blocked. The placeholder rows are
+   * footnotes about it, not a second envelope.
+   */
+  it("is not blocked while the relay still knows the task", () => {
+    const report = reconcile(incidentLedger(), { reason: "startup", current: INCIDENT_TASK, pending: [] });
+
+    expect(report.blocked).toBe(false);
+    expect(report.tasks.find((item) => item.taskId === INCIDENT_TASK)?.state).toBe("dispatched");
+
+    /*
+     * The report keeps its informational note that a requeue makes a retry
+     * look harmless; it is a note, not a green light. The gate that actually
+     * decides is the dispatch decision below, and that one refuses anything
+     * that was proven sent.
+     */
+    const kinds = report.findings.map((finding) => finding.kind);
+    expect(kinds).toContain("missing_execution_evidence");
+    expect(kinds).toContain("missing_result_receipt");
+    expect(kinds).not.toContain("identity_conflict");
+  });
+
+  /*
+   * Never let the placeholder rows turn into a reason to send again. A task
+   * that was proven sent answers the dispatch question before any retry rule
+   * can be reached, so the request above stays frozen even though the report
+   * itself carries an informational "resend" note.
+   */
+  it("cannot be resent through the dispatch decision, however the report reads", async () => {
+    const log = ledger("incident-no-resend.jsonl");
+    const service = new ReconciliationService(log);
+
+    for (const event of incidentLedger()) {
+      await log.append({
+        event: event.event,
+        taskId: event.taskId,
+        taskFingerprint: event.taskFingerprint,
+        dispatchId: event.dispatchId,
+        attempt: event.attempt,
+        source: event.source,
+      });
+    }
+
+    const history = await service.getTaskHistory(INCIDENT_TASK);
+    expect(decideDispatch(history, {
+      taskId: INCIDENT_TASK,
+      taskFingerprint: INCIDENT_HASH,
+      gptEvidence: null,
+      maxAttempts: 3,
+    })).toMatchObject({ kind: "blocked", reason: "send_confirmed" });
+  });
+
+  /*
+   * Once the live state has forgotten the task, the chain gains a blocker that
+   * has nothing to do with fingerprints: the ledger knows a task the relay
+   * does not. That finding existed before this repair and belongs to a
+   * different question, so it is reported and left alone.
+   */
+  it("reports the task as orphaned - and only as orphaned - once the relay forgot it", () => {
+    const report = reconcile(incidentLedger(), { reason: "startup", current: null, pending: [] });
+
+    expect(report.blocked).toBe(true);
+    expect(report.findings.filter((finding) => finding.severity === "blocking").map((finding) => finding.kind)).toEqual([
+      "orphaned_task",
+    ]);
+    expect(report.findings.some((finding) => finding.kind === "identity_conflict")).toBe(false);
+  });
+
+  /*
+   * Recording the placeholder that a resolution writes must not chain onto the
+   * task it is attached to: the resolution is about the hold, not about the
+   * envelope, so it carries the placeholder even when it names the task.
+   */
+  it("lifts the hold for a task without making the task look published twice", async () => {
+    const log = ledger("incident-resolved.jsonl");
+    const service = new ReconciliationService(log);
+
+    for (const event of incidentLedger()) {
+      await log.append({
+        event: event.event,
+        taskId: event.taskId,
+        taskFingerprint: event.taskFingerprint,
+        source: event.source,
+      });
+    }
+
+    await service.recordReconciliationResolved({ taskId: INCIDENT_TASK, reason: "operator decided" });
+
+    const { events: rows } = await log.list();
+    expect(rows.map((event) => event.event)).toContain("RECONCILIATION_RESOLVED");
+    expect(rows.find((event) => event.event === "RECONCILIATION_RESOLVED")?.taskFingerprint).toBe("*");
+
+    const { report } = await service.reconcile("after resolution");
+    expect(report.findings.some((finding) => finding.kind === "identity_conflict")).toBe(false);
+    expect(report.blocked).toBe(true);
+
+    /*
+     * The resolution row is bookkeeping, so the only blocker left is the task
+     * the live state has forgotten about; the resolution did not add one, and
+     * it did not silence the contradiction that never existed.
+     */
+    expect(report.findings.filter((finding) => finding.severity === "blocking").map((finding) => finding.kind)).toEqual([
+      "orphaned_task",
+    ]);
+  });
+
+  it("accepts the real envelope on top of a placeholder row the old release wrote", async () => {
+    const log = ledger("incident-publish-over-placeholder.jsonl");
+    const service = new ReconciliationService(log);
+
+    await log.append({
+      event: "TASK_REQUEUED",
+      taskId: INCIDENT_TASK,
+      taskFingerprint: "*",
+      source: "relay",
+      detail: { retryCount: 1 },
+    });
+
+    const publish = await service.recordTaskPublished({
+      taskId: INCIDENT_TASK,
+      taskFingerprint: INCIDENT_HASH,
+      source: "gpt",
+    });
+
+    expect(publish.status).toBe("ok");
+    expect(await log.length()).toBe(2);
+  });
+});
+
+describe("a contradiction that is real", () => {
+  const twoEnvelopes = (first: string, second: string): ReconciliationEvent[] => {
+    const base = incidentLedger().filter(
+      (event) => isConcreteTaskFingerprint(event.taskFingerprint) || event.event === "RECONCILIATION_MATCHED",
+    );
+
+    return base.concat([
+      { ...base[1] as ReconciliationEvent, seq: 7, event: "TASK_PUBLISHED", taskFingerprint: first },
+      { ...base[1] as ReconciliationEvent, seq: 8, event: "TASK_PUBLISHED", taskFingerprint: second, messageFingerprint: "m2" },
+    ]);
+  };
+
+  it("blocks two concrete envelopes under one task id, and offers no resend", () => {
+    const report = reconcile(twoEnvelopes(INCIDENT_HASH, "0".repeat(64)), {
+      reason: "startup",
+      current: INCIDENT_TASK,
+      pending: [],
+    });
+
+    expect(report.blocked).toBe(true);
+    expect(report.resendAllowed).toBe(false);
+
+    const conflict = report.findings.find((finding) => finding.kind === "identity_conflict");
+    expect(conflict?.severity).toBe("blocking");
+    expect(report.tasks.find((task) => task.taskId === INCIDENT_TASK)?.mayResend).toBe(false);
+  });
+
+  it("blocks the dispatch decision for the same two envelopes", () => {
+    const history = twoEnvelopes(INCIDENT_HASH, "0".repeat(64)).filter(
+      (event) => event.event === "TASK_PUBLISHED" || event.event === "RECONCILIATION_MATCHED",
+    );
+
+    expect(decideDispatch(history, {
+      taskId: INCIDENT_TASK,
+      taskFingerprint: "0".repeat(64),
+      gptEvidence: null,
+      maxAttempts: 3,
+    })).toMatchObject({ kind: "blocked", reason: "identity_conflict" });
+  });
+});
 describe("reconciliation service", () => {
   it("blocks a task id that arrives under a second envelope, and records why", async () => {
     const log = ledger("service-conflict.jsonl");

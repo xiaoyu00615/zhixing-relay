@@ -1,4 +1,4 @@
-import { dispatchIdFor } from "./fingerprint.js";
+import { dispatchIdFor, identityFingerprints } from "./fingerprint.js";
 import type { ReconciliationEvent } from "./types.js";
 
 /**
@@ -47,12 +47,6 @@ function latestAttempt(history: readonly ReconciliationEvent[]): number {
   return history.reduce((max, item) => (typeof item.attempt === "number" ? Math.max(max, item.attempt) : max), -1);
 }
 
-function distinctFingerprints(history: readonly ReconciliationEvent[]): string[] {
-  const seen = new Set<string>();
-  for (const item of history) seen.add(item.taskFingerprint);
-  return [...seen];
-}
-
 export function decideDispatch(
   history: readonly ReconciliationEvent[],
   request: DispatchRequest,
@@ -64,7 +58,13 @@ export function decideDispatch(
    * A second envelope with the same name is a contradiction, and no amount of
    * helpfulness makes a contradiction schedulable.
    */
-  const fingerprints = distinctFingerprints(history);
+  /*
+   * Only fingerprints that name the task can contradict each other. A requeue
+   * or a resolution written without an envelope to point at carries the
+   * placeholder, and counting that placeholder as a second envelope is how a
+   * healthy chain reads as "published twice with different content".
+   */
+  const fingerprints = identityFingerprints(history.map((item) => item.taskFingerprint));
   if (fingerprints.length > 1 && fingerprints.includes(request.taskFingerprint)) {
     return {
       kind: "blocked",

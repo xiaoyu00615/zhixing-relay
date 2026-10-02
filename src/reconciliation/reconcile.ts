@@ -1,4 +1,4 @@
-import { fingerprintShort } from "./fingerprint.js";
+import { fingerprintShort, identityFingerprints, UNKNOWN_FINGERPRINT } from "./fingerprint.js";
 import type { ReconciliationEvent, ReconciliationEventName } from "./types.js";
 
 /**
@@ -49,8 +49,17 @@ export type TaskReconciliation = {
   taskId: string;
   /** The fingerprint the task was first recorded under. */
   fingerprint: string;
-  /** Every fingerprint the task was ever recorded under. More than one is a contradiction. */
+  /**
+   * Every fingerprint the task was ever recorded under, placeholders
+   * included: a human reading a contradiction wants the whole chain, footnote
+   * rows as well as identity rows.
+   */
   fingerprints: string[];
+  /**
+   * The fingerprints that actually name the task. Two or more of these is a
+   * contradiction; a placeholder never is, because it names nothing.
+   */
+  identities: string[];
   dispatchIds: string[];
   attempts: number[];
   evidence: ReconciliationEventName[];
@@ -127,6 +136,14 @@ export function reconcileTask(
 ): TaskReconciliation {
   const taskId = events[0]?.taskId ?? "";
   const fingerprints = distinct(events.map((event) => event.taskFingerprint));
+  /*
+   * Identity is asked from the fingerprints that name the task and nothing
+   * else. A ledger row written by bookkeeping - a requeue or a resolution
+   * that the writer could not attach to an envelope - carries a placeholder
+   * for exactly that reason, and counting it as a second identity is what
+   * turned a working chain into a contradiction.
+   */
+  const identities = identityFingerprints(events.map((event) => event.taskFingerprint));
   const dispatchIds = distinct(
     events
       .map((event) => event.dispatchId)
@@ -148,7 +165,7 @@ export function reconcileTask(
    * different envelopes, nothing else about the task is trustworthy enough to
    * resend anything, so this one blocks on its own.
    */
-  if (fingerprints.length > 1) {
+  if (identities.length > 1) {
     findings.push({
       kind: "identity_conflict",
       severity: "blocking",
@@ -156,8 +173,8 @@ export function reconcileTask(
       dispatchId: dispatchIds[0] ?? null,
       events: evidence,
       detail:
-        `task ${taskId} was published under ${fingerprints.length} different fingerprints ` +
-        `(${fingerprints.map(fingerprintShort).join(", ")}); refusing to overwrite the old task and ` +
+        `task ${taskId} was published under ${identities.length} different fingerprints ` +
+        `(${identities.map(fingerprintShort).join(", ")}); refusing to overwrite the old task and ` +
         `refusing to send either`,
     });
   }
@@ -329,8 +346,9 @@ export function reconcileTask(
 
   return {
     taskId,
-    fingerprint: fingerprints[0] ?? "",
+    fingerprint: identities[0] ?? UNKNOWN_FINGERPRINT,
     fingerprints,
+    identities,
     dispatchIds,
     attempts,
     evidence,

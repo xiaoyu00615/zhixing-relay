@@ -36,6 +36,51 @@ export function fingerprintShort(fingerprint: string): string {
 }
 
 /**
+ * The placeholder a writer uses when it has no task to name.
+ *
+ * It is bookkeeping, not identity: it says "the row exists, but nobody knew
+ * which task it belongs to". Treating it as a fingerprint of a task is what
+ * makes a healthy chain look like a contradiction - one real envelope and one
+ * placeholder are not two versions of the same work, they are one version and
+ * one footnote about it.
+ */
+export const UNKNOWN_FINGERPRINT = "*";
+
+/**
+ * True for a fingerprint that actually names a task.
+ *
+ * A real fingerprint is any value a writer could have hashed an envelope
+ * into. The placeholder, an empty string and a missing value name nothing, so
+ * they are not identity and can never be one half of a contradiction.
+ */
+export function isConcreteTaskFingerprint(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value !== UNKNOWN_FINGERPRINT;
+}
+
+/**
+ * The fingerprints of a chain that name the task, distinct, in order of first
+ * appearance.
+ *
+ * This - and only this - is what identity conflicts are counted from: more
+ * than one entry here means the same taskId was published under two different
+ * envelopes, which is a contradiction a human has to settle. One entry, no
+ * matter how many placeholder rows surround it, is one identity.
+ */
+export function identityFingerprints(fingerprints: readonly (string | null | undefined)[]): string[] {
+  const seen: string[] = [];
+  const known = new Set<string>();
+
+  for (const value of fingerprints) {
+    if (!isConcreteTaskFingerprint(value)) continue;
+    if (known.has(value)) continue;
+    known.add(value);
+    seen.push(value);
+  }
+
+  return seen;
+}
+
+/**
  * The dispatch id for one attempt at one task.
  *
  * `${taskId}#${attempt}` is the whole identity of a send: the same attempt
