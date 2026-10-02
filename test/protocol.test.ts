@@ -465,3 +465,108 @@ describe("relay protocol", () => {
     expect(output).toContain("PASS");
   });
 });
+
+/*
+ * A task that explains the protocol while carrying one. The example lives in
+ * a code fence, and a fence is documentation, not an envelope: without this
+ * the message closes itself at the example's END marker and WorkBuddy receives
+ * the task cut off after its first section.
+ */
+describe("relay protocol - a task that documents the protocol", () => {
+  const example = [
+    "```text",
+    "[ZHIXING_RELAY]",
+    "TYPE: TASK",
+    "TASK_ID: example-task",
+    "",
+    "任务正文",
+    "",
+    "[ZHIXING_RELAY_END]",
+    "```",
+  ].join("\n");
+
+  it("does not close the real envelope at the example's END marker", () => {
+    const message = [
+      "[ZHIXING_RELAY]",
+      "TYPE: TASK",
+      "TASK_ID: real-task",
+      "MODEL: hy3",
+      "SOURCE: GPT",
+      "",
+      "第一节：先把这里说完。",
+      "",
+      "协议长这样：",
+      example,
+      "",
+      "第二节：继续真正的工作。",
+      "",
+      "[ZHIXING_RELAY_END]",
+    ].join("\n");
+
+    const blocks = scanRelayBlocks(message);
+
+    expect(blocks.complete).toHaveLength(1);
+    expect(blocks.complete[0]?.block.trim().endsWith("[ZHIXING_RELAY_END]")).toBe(true);
+  });
+
+  it("sends the body the GPT side actually wrote, not the first half of it", () => {
+    const message = [
+      "分析前置文字。",
+      "",
+      "[ZHIXING_RELAY]",
+      "TYPE: TASK",
+      "TASK_ID: real-task",
+      "SOURCE: GPT",
+      "",
+      "第一节：先把这里说完。",
+      "",
+      "协议长这样：",
+      example,
+      "",
+      "第二节：继续真正的工作。",
+      "",
+      "后置说明文字。",
+      "",
+      "[ZHIXING_RELAY_END]",
+    ].join("\n");
+
+    const intent = readRelayIntent(message);
+
+    expect(intent.kind).toBe("task");
+    if (intent.kind !== "task") return;
+
+    const block = intent.task.block ?? "";
+    expect(block).toContain("第一节");
+    expect(block).toContain("第二节");
+    expect(block).toContain("后置说明文字");
+    expect(block).not.toContain("分析前置文字");
+    expect(intent.task.ambiguous).toBe(false);
+  });
+
+  it("treats markers inside an indented or tilde fence as documentation too", () => {
+    const tilde = ["~~~text", "[ZHIXING_RELAY]", "TYPE: TASK", "[ZHIXING_RELAY_END]", "~~~"].join("\n");
+    const message = [
+      "[ZHIXING_RELAY]",
+      "TYPE: TASK",
+      "TASK_ID: real-task",
+      "",
+      tilde,
+      "",
+      "真正的收尾。",
+      "",
+      "[ZHIXING_RELAY_END]",
+    ].join("\n");
+
+    const { complete } = scanRelayBlocks(message);
+    expect(complete).toHaveLength(1);
+    expect(readRelayIntent(message).kind).toBe("task");
+  });
+
+  it("still ignores a marker that only appears inside a paragraph", () => {
+    const message = [
+      "如果你写 [ZHIXING_RELAY] 然后 [ZHIXING_RELAY_END]，这里什么也不会发生。",
+    ].join("\n");
+
+    expect(readRelayIntent(message).kind).toBe("ignored");
+  });
+});

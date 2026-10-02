@@ -12,6 +12,9 @@ export type PendingItem =
       text: string;
       fingerprint: string;
       createdAt: string;
+      taskFingerprint?: string | undefined;
+      dispatchId?: string | undefined;
+      attempt?: number | undefined;
       /** Present when this queue entry is a failing turn's second attempt. */
       taskId?: string;
       retryCount?: number;
@@ -29,6 +32,15 @@ export type PendingItem =
 export type CurrentTask = {
   taskId: string;
   sourceFingerprint: string;
+  /**
+   * Stable fingerprint of the published TASK block. Two turns carrying the
+   * same fingerprint are the same task, whatever their task id says.
+   */
+  taskFingerprint?: string | undefined;
+  /** Identity of this particular send, which the task survives. */
+  dispatchId?: string | undefined;
+  /** Which attempt at this task this turn is. */
+  attempt?: number | undefined;
   sourceText: string;
   workbuddyOutboundMessageId?: string;
   startedAt: string;
@@ -102,6 +114,16 @@ export type ExtensionInbound =
       ts?: number;
     }
   | {
+      /**
+       * Facts read off the ChatGPT page - message identity, fingerprint, raw
+       * text and order. Deciding what they mean stays in the relay.
+       */
+      type: "recent_assistant_messages";
+      requestId: string;
+      limit?: number | undefined;
+      messages?: { id: string; fingerprint: string; text: string }[];
+    }
+  | {
       type: "chatgpt_send_result";
       requestId?: string | null;
       ok: boolean;
@@ -117,6 +139,12 @@ export type RelayToExtension =
       requestId: string;
       text: string;
       autoSend: boolean;
+    }
+  | {
+      /** Read-only: the relay asks the page what it currently shows. */
+      type: "fetch_recent_assistant_messages";
+      requestId: string;
+      limit?: number | undefined;
     }
   | {
       type: "pause_bridge";

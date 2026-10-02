@@ -36,15 +36,27 @@ function lineOffsets(lines: readonly string[]): number[] {
 }
 
 function makeBlock(raw: string, from: number, to: number, legacy: boolean): TaskBlock {
-  const open = raw.indexOf(RELAY_BLOCK_OPEN, from);
-  const close = legacy ? -1 : raw.indexOf(RELAY_BLOCK_CLOSE, from);
+  /*
+   * The boundaries come from the line scan, never from a fresh search over
+   * the text: a marker quoted inside the body must not be mistaken for the
+   * marker that ends the envelope. `to` is already the offset just past the
+   * END marker, or the end of the message in the legacy form.
+   */
+  const open = from;
 
   return {
-    block: raw.slice(open, close < 0 ? to : close + RELAY_BLOCK_CLOSE.length).trim(),
+    block: raw.slice(open, to).trim(),
     before: raw.slice(0, open).trim(),
-    after: close < 0 ? "" : raw.slice(close + RELAY_BLOCK_CLOSE.length).trim(),
+    after: legacy ? "" : raw.slice(to).trim(),
     legacy,
   };
+}
+
+/** ` ```lang ` or ` ~~~lang `: opens and closes a Markdown block quote. */
+const FENCE_DELIMITER = /^(`{3,}|~{3,})/;
+
+function isFenceDelimiter(line: string): boolean {
+  return FENCE_DELIMITER.test(line);
 }
 
 /**
@@ -53,7 +65,14 @@ function makeBlock(raw: string, from: number, to: number, legacy: boolean): Task
  * Markers only count when they own their whole line, so a task body that quotes
  * the protocol (a code fence, a paragraph mentioning the marker) cannot open a
  * second block, and prose that merely mentions `[ZHIXING_RELAY]` is not a task.
+ *
+ * The scan is also fence aware: markers written inside a fenced region are
+ * documentation of the protocol, not the protocol. Without this a message that
+ * explains the protocol while carrying a task - the normal way to write one of
+ * these - closes its own envelope at the END marker of the example, and
+ * WorkBuddy receives the task cut off after its first section.
  */
+
 export function scanRelayBlocks(text: string): {
   complete: TaskBlock[];
   unterminated: TaskBlock[];
@@ -67,10 +86,17 @@ export function scanRelayBlocks(text: string): {
 
   let openLine = -1;
   let openAt = 0;
+  let fenced = false;
 
   for (let index = 0; index < lines.length; index += 1) {
     const trimmed = (lines[index] ?? "").trim();
     const at = offsets[index] ?? 0;
+
+    // Fence state is tracked before the marker test: a marker inside a fence
+    // is an example of the protocol, and an example never moves a boundary.
+    if (isFenceDelimiter(trimmed)) fenced = !fenced;
+
+    if (fenced) continue;
 
     if (openLine < 0) {
       if (trimmed !== RELAY_BLOCK_OPEN) continue;
@@ -81,7 +107,7 @@ export function scanRelayBlocks(text: string): {
 
     if (trimmed !== RELAY_BLOCK_CLOSE) continue;
 
-    complete.push(makeBlock(raw, openAt, at, false));
+    complete.push(makeBlock(raw, openAt, at + trimmed.length, false));
     openLine = -1;
     openAt = 0;
   }
@@ -92,6 +118,7 @@ export function scanRelayBlocks(text: string): {
    * still written this way, so dropping this branch would break completion.
    */
   if (openLine >= 0) {
+    // Legacy: the envelope runs to the end of the message.
     unterminated.push(makeBlock(raw, openAt, raw.length, true));
   }
 

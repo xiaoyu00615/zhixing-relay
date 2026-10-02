@@ -106,6 +106,7 @@ export function loadConfig() {
       state: new URL("../data/state.json", import.meta.url),
       tokens: new URL("../data/tokens.json", import.meta.url),
       audit: new URL("../data/audit.jsonl", import.meta.url),
+      ledger: new URL("../data/ledger.jsonl", import.meta.url),
       models: new URL("../data/models.json", import.meta.url),
     },
   };

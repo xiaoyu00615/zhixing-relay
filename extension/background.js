@@ -479,6 +479,62 @@ async function connect() {
 
 
     if (
+      message.type === "fetch_recent_assistant_messages"
+    ) {
+
+      /*
+       * Read-only: the page is asked what it currently shows and the answer
+       * goes straight back. Nothing is typed, nothing is clicked, and no
+       * business decision is taken here - Relay owns the parser.
+       */
+      try {
+
+        const contentResult =
+          await sendToTargetTab({
+            type:
+              "ZHIXING_FETCH_RECENT_ASSISTANT_MESSAGES",
+            requestId:
+              message.requestId || null,
+            limit:
+              message.limit || 5
+          });
+
+
+        await sendToRelay({
+          type:
+            "recent_assistant_messages",
+          requestId:
+            message.requestId || null,
+          limit:
+            message.limit || 5,
+          messages:
+            contentResult?.messages || []
+        });
+
+      }
+      catch (error) {
+
+        console.error(
+          "[Zhixing Bridge] recent assistant messages failed:",
+          error
+        );
+
+        await sendToRelay({
+          type:
+            "recent_assistant_messages",
+          requestId:
+            message.requestId || null,
+          messages: []
+        });
+
+      }
+
+      return;
+
+    }
+
+
+    if (
       message.type === "send_to_chatgpt" &&
       typeof message.text === "string"
     ) {

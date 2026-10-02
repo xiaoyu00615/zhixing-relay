@@ -26,6 +26,14 @@ import {
 } from "./workbuddy/quota.js";
 import type { ModelRouter } from "./model-router/router.js";
 import type { ModelUnavailableReason, ModelSelection } from "./model-router/types.js";
+import {
+  decideDispatch,
+  dispatchIdFor,
+  type DispatchDecision,
+  ReconciliationService,
+  TaskLedger,
+  taskFingerprint,
+} from "./reconciliation/index.js";
 
 /**
  * One routed turn: the model the router picked for this task. Kept next to
@@ -65,6 +73,19 @@ export class ZhixingRelay {
   private bridgeSince: number | null = null;
   /** Last WorkBuddy liveness probe, null until the first one ran. */
   private workbuddyUp: boolean | null = null;
+  /**
+   * The task ledger and the reconciliation that reads it. Null when the relay
+   * has no configured data path: then nothing is recorded and no decision is
+   * made, because evidence nobody will read must not block a live round.
+   */
+  private readonly reconciliation: ReconciliationService | null;
+  /** Reconciliation found a chain that must not be auto-sent any more. */
+  private reconciliationHold = false;
+  /** Answers to `fetch_recent_assistant_messages`, keyed by request id. */
+  private recentMessageWaiters = new Map<
+    string,
+    (messages: { id: string; fingerprint: string; text: string }[]) => void
+  >();
   private heartbeatWarned = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
@@ -80,7 +101,12 @@ export class ZhixingRelay {
      * turn goes to whatever model WorkBuddy already shows.
      */
     private readonly router: ModelRouter | null = null,
-  ) {}
+  ) {
+    const ledgerPath = this.config.paths?.ledger;
+    this.reconciliation = ledgerPath
+      ? new ReconciliationService(new TaskLedger(ledgerPath))
+      : null;
+  }
 
   async init(): Promise<void> {
     const loaded = await this.store.load();
@@ -104,6 +130,10 @@ export class ZhixingRelay {
     }
 
     this.bridge.onMessage((message) => this.onExtensionMessage(message));
+
+    // The ledger is checked once at start-up: a restart that left a task
+    // half-way is exactly the case a reconciliation pass exists to describe.
+    await this.runReconciliation("startup");
   }
 
   /**
@@ -448,6 +478,9 @@ export class ZhixingRelay {
     this.noteBridgeTraffic();
 
     switch (message.type) {
+      case "recent_assistant_messages":
+        this.resolveRecentMessageRequest(message);
+        return;
       case "bridge_hello":
         await this.audit.write("bridge_connected", {
           source: message.source || "unknown",
@@ -647,6 +680,25 @@ export class ZhixingRelay {
   }
 
   /** A machine-readable reason for a reply that carried nothing to do. */
+  /**
+   * Hands the answer to `fetch_recent_assistant_messages` to whoever asked.
+   *
+   * The messages arrive as the page's facts; deciding what they mean is not
+   * this method's business.
+   */
+  private resolveRecentMessageRequest(message: Extract<ExtensionInbound, { type: "recent_assistant_messages" }>): void {
+    const waiter = this.recentMessageWaiters.get(message.requestId);
+    if (!waiter) return;
+    this.recentMessageWaiters.delete(message.requestId);
+    waiter(
+      (message.messages ?? []).map((item) => ({
+        id: item.id,
+        fingerprint: item.fingerprint,
+        text: item.text,
+      })),
+    );
+  }
+
   private static intentReason(intent: RelayIntent): string {
     if (intent.kind === "ambiguous") return `ambiguous:${intent.count}_blocks`;
     if (intent.kind === "ignored") return intent.reason;
@@ -705,6 +757,20 @@ export class ZhixingRelay {
     }
 
     const taskId = ensureTaskId(text, makeId("task"));
+    const fingerprint = taskFingerprint(text);
+
+    /*
+     * Identity first, WorkBuddy second. From here the ledger decides whether
+     * this task may be sent, so a task that already ran - or that contradicts
+     * an earlier envelope of the same name - stops here instead of going out
+     * a second time.
+     */
+    const plan = await this.publishTask({
+      taskId,
+      fingerprint,
+      messageFingerprint: sourceFingerprint,
+    });
+    if (!plan) return;
 
     /*
      * A task may name the model that has to run it. Kept as the raw header
@@ -773,6 +839,16 @@ export class ZhixingRelay {
       }
     }
 
+    if (this.reconciliation) {
+      await this.reconciliation.recordDispatch({
+        taskId,
+        taskFingerprint: fingerprint,
+        dispatchId: plan.dispatchId,
+        attempt: plan.attempt,
+        model: routed?.id ?? null,
+      });
+    }
+
     try {
       const online = await this.workbuddy.online();
       if (!online) {
@@ -785,6 +861,9 @@ export class ZhixingRelay {
         sourceFingerprint,
         requestedModelId,
         routed,
+        dispatchId: plan.dispatchId,
+        taskFingerprint: fingerprint,
+        attempt: plan.attempt,
         signal: this.workAbort?.signal,
         onProgress: async (message) => {
           await this.audit.write("workbuddy_assistant_chunk", {
@@ -861,6 +940,10 @@ export class ZhixingRelay {
     taskId: string;
     text: string;
     sourceFingerprint: string;
+    /** Identity of this send, so the evidence events can name it. */
+    dispatchId?: string | undefined;
+    taskFingerprint?: string | undefined;
+    attempt?: number | undefined;
     requestedModelId: string | null;
     routed: RoutedModel | null;
     signal?: AbortSignal | undefined;
@@ -956,6 +1039,20 @@ export class ZhixingRelay {
 
       const outboundId = await this.workbuddy.sendText(text);
 
+      /*
+       * The moment this resolves the task is on its way into WorkBuddy, and a
+       * retry is no longer provably safe. That is exactly why the evidence is
+       * written here rather than after the wait.
+       */
+      await this.recordEvidence({
+        event: "SEND_CONFIRMED",
+        taskId,
+        taskFingerprint: args.taskFingerprint ?? "",
+        dispatchId: args.dispatchId ?? "",
+        attempt: args.attempt ?? 0,
+        workbuddyMessageId: outboundId,
+      });
+
       await this.store.mutate((state) => {
         if (!state.currentTask || state.currentTask.taskId !== taskId) return;
         state.currentTask.workbuddyOutboundMessageId = outboundId;
@@ -978,6 +1075,19 @@ export class ZhixingRelay {
       });
 
       this.workAbort = null;
+
+      /*
+       * Output means the turn really ran. Whether or not it finishes is not
+       * known yet, and that is the one thing that must never be guessed at.
+       */
+      await this.recordEvidence({
+        event: "RUNNING_CONFIRMED",
+        taskId,
+        taskFingerprint: args.taskFingerprint ?? "",
+        dispatchId: args.dispatchId ?? "",
+        attempt: args.attempt ?? 0,
+        workbuddyMessageId: outboundId,
+      });
 
       if (!result.text) {
         throw new Error("WorkBuddy returned an empty assistant response");
@@ -1425,6 +1535,16 @@ export class ZhixingRelay {
       length: wrapped.length,
     });
 
+    const current = this.store.snapshot().currentTask;
+    await this.recordEvidence({
+      event: "RESULT_RECEIVED",
+      taskId,
+      taskFingerprint: current?.taskFingerprint ?? "*",
+      dispatchId: current?.dispatchId ?? null,
+      attempt: current?.attempt ?? null,
+      workbuddyMessageId,
+    });
+
     /*
      * The RESULT exists from this moment on, so the lease is armed now and
      * cleared by whichever path actually commits it. A send that never lands
@@ -1494,6 +1614,16 @@ export class ZhixingRelay {
       taskId,
       releasedAt: isoNow(),
       reason,
+    });
+
+    await this.recordEvidence({
+      event: "TASK_COMPLETED",
+      taskId,
+      taskFingerprint: task?.taskFingerprint ?? "*",
+      dispatchId: task?.dispatchId ?? null,
+      attempt: task?.attempt ?? null,
+      workbuddyMessageId: task?.workbuddyOutboundMessageId ?? null,
+      detail: { reason },
     });
 
     console.log(`[relay] round ${taskId} completed (${reason})`);
@@ -1618,9 +1748,203 @@ export class ZhixingRelay {
       error: args.detail,
     });
 
+    const requeued = this.store.snapshot().currentTask;
+    await this.recordEvidence({
+      event: "TASK_REQUEUED",
+      taskId: args.taskId,
+      taskFingerprint: requeued?.taskFingerprint ?? "*",
+      attempt: requeued?.attempt ?? null,
+      dispatchId: requeued?.dispatchId ?? null,
+      detail: { retryCount, reason: args.reason },
+    });
+
     console.warn(
       `[relay] task ${args.taskId} requeued (attempt ${retryCount}) after ${args.reason}`,
     );
+  }
+
+  /**
+   * Publishes a task to the ledger and decides whether it may be sent.
+   *
+   * Returns null when the answer is "no". Every "no" here is a case where the
+   * honest state of the world is unknown or contradictory, and unknown is the
+   * one condition under which sending again is the worst option available:
+   * a duplicate of a task that already ran cannot be undone.
+   */
+  private async publishTask(args: {
+    taskId: string;
+    fingerprint: string;
+    messageFingerprint: string;
+  }): Promise<{ dispatchId: string; attempt: number } | null> {
+    if (!this.reconciliation) {
+      // No ledger configured: the old behaviour, and no invented decision.
+      return { dispatchId: dispatchIdFor(args.taskId, 0), attempt: 0 };
+    }
+
+    const published = await this.reconciliation.recordTaskPublished({
+      taskId: args.taskId,
+      taskFingerprint: args.fingerprint,
+      messageFingerprint: args.messageFingerprint,
+      source: "gpt",
+    });
+
+    if (published.status === "blocked") {
+      await this.audit.write("reconciliation_blocked", {
+        taskId: args.taskId,
+        reason: "identity_conflict",
+      });
+      console.error(
+        `[relay] task ${args.taskId} blocked: the same taskId was published before ` +
+          `under a different envelope; nothing was sent`,
+      );
+      return null;
+    }
+
+    const history = await this.reconciliation.getTaskHistory(args.taskId);
+    const decision = decideDispatch(history, {
+      taskId: args.taskId,
+      taskFingerprint: args.fingerprint,
+      gptEvidence: await this.gptEvidenceFor(args.taskId, args.fingerprint),
+      maxAttempts: this.maxTaskRetries(),
+    });
+
+    if (decision.kind === "blocked") {
+      await this.reconciliation.recordExecutionEvidence({
+        event: "TASK_BLOCKED",
+        taskId: args.taskId,
+        taskFingerprint: args.fingerprint,
+        detail: { reason: decision.reason, detail: decision.detail },
+      });
+      await this.audit.write("reconciliation_blocked", {
+        taskId: args.taskId,
+        reason: decision.reason,
+        detail: decision.detail,
+      });
+      console.error(`[relay] task ${args.taskId} not sent (${decision.reason}): ${decision.detail}`);
+      return null;
+    }
+
+    return { dispatchId: decision.dispatchId, attempt: decision.attempt };
+  }
+
+  /**
+   * Writes one execution-evidence event.
+   *
+   * The write is best-effort by design: the relay must not disappear because
+   * a log file could not be opened, and a turn that already happened does not
+   * stop happening because its evidence could not be stored.
+   */
+  private async recordEvidence(input: {
+    event: Parameters<ReconciliationService["recordExecutionEvidence"]>[0]["event"];
+    taskId: string;
+    taskFingerprint: string;
+    dispatchId?: string | null;
+    attempt?: number | null;
+    workbuddyMessageId?: string | null;
+    resultId?: string | null;
+    detail?: Record<string, unknown> | null;
+  }): Promise<void> {
+    if (!this.reconciliation) return;
+
+    try {
+      await this.reconciliation.recordExecutionEvidence(input);
+    } catch (error) {
+      console.error(
+        `[relay] could not record ${input.event} for ${input.taskId}: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Reads the ledger and acts on what it finds.
+   *
+   * A blocking finding freezes all further automatic scheduling, which is the
+   * only safe answer to a chain that cannot be explained - flushing the next
+   * task on top of an unexplained one is how two tasks end up running.
+   */
+  private async runReconciliation(reason: string): Promise<void> {
+    if (!this.reconciliation) return;
+
+    try {
+      const { report } = await this.reconciliation.reconcile(reason);
+      await this.reconciliation.recordReconciliationOutcome(report);
+
+      if (report.blocked) {
+        this.reconciliationHold = true;
+        await this.audit.write("reconciliation_blocked", {
+          reason,
+          tasks: report.tasks.map((task) => ({ taskId: task.taskId, state: task.state })),
+        });
+        console.error(
+          `[relay] reconciliation blocked automatic scheduling (${reason}): ` +
+            `${report.findings.filter((f) => f.severity === "blocking").map((f) => f.kind).join(", ")}`,
+        );
+        return;
+      }
+
+      console.log(
+        `[relay] reconciliation clean (${reason}): ${report.tasksSeen} task(s) checked`,
+      );
+    } catch (error) {
+      console.error(
+        `[relay] reconciliation failed (${reason}): ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * The task as it was last seen on the GPT page, or null.
+   *
+   * The Chrome extension only carries facts - message ids, raw text and
+   * order. Which of those messages is a task, and whether it is this task, is
+   * parsed here, because the relay owns the protocol and the identity.
+   */
+  private async gptEvidenceFor(
+    taskId: string,
+    fingerprint: string,
+  ): Promise<{ taskId: string; taskFingerprint: string } | null> {
+    const messages = await this.recentAssistantMessages(5);
+    if (messages.length === 0) return null;
+
+    for (const message of messages) {
+      const intent = readRelayIntent(message.text);
+      if (intent.kind !== "task") continue;
+      if (intent.task.taskId !== taskId || intent.task.block === null) continue;
+      if (taskFingerprint(intent.task.block) !== fingerprint) continue;
+      return { taskId, taskFingerprint: fingerprint };
+    }
+
+    return null;
+  }
+
+  /**
+   * Asks the pinned ChatGPT tab for its most recent assistant messages.
+   *
+   * Read-only by construction: nothing is typed, nothing is clicked, and the
+   * extension makes no decision about what a message means.
+   */
+  private async recentAssistantMessages(limit: number): Promise<
+    { id: string; fingerprint: string; text: string }[]
+  > {
+    if (!this.bridge.hasClient()) return [];
+
+    const requestId = makeId("recent-msgs");
+    const messages = await new Promise<{ id: string; fingerprint: string; text: string }[]>(
+      (resolve) => {
+        const timer = setTimeout(() => resolve([]), 2000);
+        this.recentMessageWaiters.set(requestId, (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        });
+        void this.bridge
+          .send({ type: "fetch_recent_assistant_messages", requestId, limit })
+          .catch(() => resolve([]));
+      },
+    );
+
+    return messages;
   }
 
   /** RELAY_MAX_TASK_RETRIES, so a task WorkBuddy always refuses cannot cycle for ever. */
@@ -1710,6 +2034,19 @@ export class ZhixingRelay {
   }
 
   private async flushOnePending(): Promise<void> {
+    /*
+     * Reconciliation holds the line. Flushing the next task over an
+     * unexplained one is how two tasks end up running at once, so this is the
+     * one gate that outranks the queue.
+     */
+    if (this.reconciliationHold) {
+      console.error(
+        "[relay] scheduling frozen: reconciliation is blocked, flush refused " +
+          "(nothing was sent, nothing was queued)",
+      );
+      return;
+    }
+
     const snapshot = this.store.snapshot();
 
     /*

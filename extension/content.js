@@ -754,6 +754,84 @@ function getAssistantUnitKey(node) {
 
 
 
+/*
+ * ============================================================
+ * Relay -> page: read-only facts for reconciliation.
+ * ============================================================
+ *
+ * This returns what the page shows - identity, fingerprint and raw text in
+ * document order. It makes no decision: which message is a task, and whether
+ * the task is the one in hand, is decided by Relay's protocol parser.
+ */
+
+function readRecentAssistantMessages(
+  limit
+) {
+
+  const limitNumber =
+    Number(limit) > 0
+    ?
+    Number(limit)
+    : 5;
+
+
+  const nodes =
+    getAssistantBodies();
+
+
+  const messages =
+    nodes.map(
+      function (
+        node
+      ) {
+
+        const text =
+          extractAssistantText(
+            node
+          );
+
+
+        return {
+          id:
+            getAssistantMessageId(
+              node
+            ) ||
+            getAssistantUnitKey(
+              node
+            ) ||
+            null,
+          fingerprint:
+            makeAssistantFingerprint(
+              node,
+              text
+            ),
+          text:
+            text
+        };
+
+      }
+    )
+    .filter(
+      function (
+        message
+      ) {
+
+        return Boolean(
+          message.text
+        );
+
+      }
+    );
+
+
+  return messages.slice(
+    -limitNumber
+  );
+
+}
+
+
+
 function makeAssistantFingerprint(
   node,
   text
@@ -1958,6 +2036,26 @@ chrome.runtime.onMessage.addListener(
       "[Zhixing Relay] received:",
       message
     );
+
+
+    if (
+      message?.type ===
+      "ZHIXING_FETCH_RECENT_ASSISTANT_MESSAGES"
+    ) {
+
+      sendResponse(
+        {
+          ok: true,
+          messages:
+            readRecentAssistantMessages(
+              message.limit || 5
+            )
+        }
+      );
+
+      return true;
+
+    }
 
 
     if (
