@@ -45,8 +45,16 @@ export type RuntimeControl = {
    * about the task *being run* - the requeue path puts it back on the queue -
    * while a historical close is a statement about a task the live state has
    * already lost, and it must never requeue anything.
+   *
+   * Required, and spelled with the relay's own canonical name, because
+   * `src/index.ts` hands the whole `ZhixingRelay` to this transport: an
+   * optional field is exactly what let a rename on the relay turn into a
+   * runtime 501 instead of a build error. A relay with no ledger is not a
+   * relay missing this capability - it answers through it, with `ok:false`
+   * and a message saying there is nothing to close, so "no reconciliation
+   * service" is a business answer and never a transport-level 501.
    */
-  closeTaskWithoutResend?: (input: {
+  closeReconciledTaskWithoutResend: (input: {
     taskId: string;
     reason: string;
   }) => Promise<{ ok: boolean; message: string; blocked: boolean; findings: string[] }>;
@@ -218,14 +226,6 @@ function routeFor(
         const disposition = url.searchParams.get("disposition");
         const reason = url.searchParams.get("reason") ?? "control channel";
 
-        if (typeof control.closeTaskWithoutResend !== "function") {
-          sendJson(res, 501, {
-            ok: false,
-            error: "reconciliation is not available on this relay",
-          });
-          return;
-        }
-
         if (taskId.length === 0) {
           sendJson(res, 409, {
             ok: false,
@@ -242,7 +242,7 @@ function routeFor(
           return;
         }
 
-        const result = await control.closeTaskWithoutResend({ taskId, reason });
+        const result = await control.closeReconciledTaskWithoutResend({ taskId, reason });
         sendJson(res, result.ok ? 200 : 409, result);
       };
 

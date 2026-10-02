@@ -535,6 +535,15 @@ describe("the incident ledger", () => {
       "orphaned_task",
     ]);
     expect(report.findings.some((finding) => finding.kind === "identity_conflict")).toBe(false);
+
+    /*
+     * The forgotten accident carries SEND_CONFIRMED and TASK_REQUEUED. It is
+     * blocked, and it must not also wear a note offering a resend: the note
+     * and the gate are the same fact now, so no resend_allowed is printed for
+     * a chain the relay has already proven it sent.
+     */
+    expect(report.resendAllowed).toBe(false);
+    expect(report.findings.map((finding) => finding.kind)).not.toContain("resend_allowed");
   });
 
   /*
@@ -870,6 +879,14 @@ describe("a task the relay has forgotten", () => {
     expect(proven.tasks.find((task) => task.taskId === INCIDENT_TASK)?.mayResend).toBe(false);
     expect(proven.resendAllowed).toBe(false);
 
+    /*
+     * The note and the gate are one fact. The chain below carries a proven
+     * send, so it must not carry a `resend_allowed` finding either: a report
+     * that offers a resend the relay is about to refuse is worse than no
+     * report, because it is what an operator acts on.
+     */
+    expect(proven.findings.map((finding) => finding.kind)).not.toContain("resend_allowed");
+
     const unproven = reconcile(
       incidentLedger().filter((event) => event.event !== "SEND_CONFIRMED"),
       { reason: "manual", pending: [], current: INCIDENT_TASK },
@@ -877,6 +894,7 @@ describe("a task the relay has forgotten", () => {
 
     expect(unproven.tasks.find((task) => task.taskId === INCIDENT_TASK)?.mayResend).toBe(true);
     expect(unproven.resendAllowed).toBe(true);
+    expect(unproven.findings.map((finding) => finding.kind)).toContain("resend_allowed");
   });
 });
 

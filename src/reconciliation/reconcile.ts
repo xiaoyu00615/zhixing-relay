@@ -446,18 +446,6 @@ export function reconcileTask(
     }
   }
 
-  if (has("TASK_REQUEUED") && !has("RUNNING_CONFIRMED")) {
-    findings.push({
-      kind: "resend_allowed",
-      severity: "info",
-      taskId,
-      dispatchId: null,
-      detail:
-        "the task was requeued and nothing ever confirmed that it ran, so a retry is not a duplicate",
-      events: ["TASK_REQUEUED"],
-    });
-  }
-
   const blocking = findings.some((finding) => finding.severity === "blocking");
 
   /*
@@ -466,9 +454,31 @@ export function reconcileTask(
    * requeue is any evidence that WorkBuddy got the task, so the old requeue
    * row from an earlier release cannot reopen a send that already happened -
    * and a task an operator closed is not ours to send either.
+   *
+   * This boolean is the only answer to "may this task be sent again".
    */
   const mayResend =
     !blocking && closure === null && has("TASK_REQUEUED") && !hasProvenSend(evidence);
+
+  /*
+   * The same fact, printed. It used to be computed a second time under a
+   * looser condition - "requeued and never confirmed running" - which let a
+   * chain with a proven send advertise a resend the gate above refuses,
+   * and an operator reading the report believed the opposite of what the
+   * relay was about to do. One boolean, one source: no `resend_allowed`
+   * finding is ever emitted for a task that may not be resent.
+   */
+  if (mayResend) {
+    findings.push({
+      kind: "resend_allowed",
+      severity: "info",
+      taskId,
+      dispatchId: null,
+      detail:
+        "the task was requeued and nothing proves WorkBuddy ever got it, so a retry is not a duplicate",
+      events: ["TASK_REQUEUED"],
+    });
+  }
 
   if (findings.length === 0) {
     findings.push({

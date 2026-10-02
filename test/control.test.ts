@@ -21,6 +21,7 @@ import {
   secretMatches,
   startControlServer,
   type ControlServer,
+  type RuntimeControl,
 } from "../src/control.js";
 import type { AuditLog } from "../src/audit.js";
 import { ZhixingRelay } from "../src/relay.js";
@@ -53,7 +54,7 @@ let control: {
   resume: () => Promise<void>;
   requestRestart: (reason: string) => Promise<{ ok: boolean; message: string }>;
   emitHeartbeat: () => string;
-  closeTaskWithoutResend: (input: { taskId: string; reason: string }) => Promise<{
+  closeReconciledTaskWithoutResend: (input: { taskId: string; reason: string }) => Promise<{
     ok: boolean;
     message: string;
     blocked: boolean;
@@ -151,7 +152,7 @@ beforeEach(async () => {
       calls.push("heartbeat");
       return inner.emitHeartbeat();
     },
-    closeTaskWithoutResend: (input) => {
+    closeReconciledTaskWithoutResend: (input) => {
       calls.push(`close:${input.taskId}`);
       return inner.closeReconciledTaskWithoutResend(input);
     },
@@ -415,5 +416,137 @@ describe("closing a task the relay has forgotten", () => {
     expect(inner.status().pending).toEqual([]);
     expect(inner.status().currentTask).toBeNull();
     expect(calls).toEqual([`close:${CLOSED_TASK}`]);
+  });
+});
+
+/*
+ * The wiring, not the route.
+ *
+ * Everything above wraps the relay in a recording object, which is how the
+ * routes are proven to reach the relay - and also how a production drift can
+ * hide: `src/index.ts` never wraps anything, it hands the whole
+ * `ZhixingRelay` to `startControlServer({ control: relay })`, so what has to
+ * stay true in production is not "some object answers this name" but
+ * "ZhixingRelay satisfies RuntimeControl, under the canonical name".
+ *
+ * The block below assembles exactly that, with no adapter in between: a real
+ * relay object, a real control server, one POST. If the transport ever calls
+ * the close by any other name again, this stops compiling - and if it stops
+ * compiling, the historical close is unreachable in production, which is
+ * precisely the 501 an operator hit.
+ */
+describe("the production wiring, with no adapter in between", () => {
+  let wiringSeq = 0;
+
+  /** A relay on its own throwaway state and ledger, exactly as in production. */
+  async function realRelay(dir: string): Promise<ZhixingRelay> {
+    const relayStore = new RelayStore(pathToFileURL(join(dir, "state.json")));
+    await relayStore.load();
+
+    const relay = new ZhixingRelay(
+      {
+        relay: {},
+        paths: { ledger: pathToFileURL(join(dir, "ledger.jsonl")) },
+      } as unknown as AppConfig,
+      fakeBridge(),
+      relayStore,
+      fakeAudit(),
+      fakeWorkbuddy(),
+      null,
+    );
+    await relay.init();
+
+    return relay;
+  }
+
+  it("closes a forgotten task through the relay's own canonical method", async () => {
+    wiringSeq += 1;
+    const dir = join(sandboxRoot, `wiring-${process.pid}-${wiringSeq}`);
+    const relay = await realRelay(dir);
+
+    const log = new TaskLedger(pathToFileURL(join(dir, "ledger.jsonl")));
+    await log.append({ event: "TASK_PUBLISHED", taskId: CLOSED_TASK, taskFingerprint: CLOSED_HASH, source: "gpt" });
+    await log.append({
+      event: "DISPATCH_STARTED",
+      taskId: CLOSED_TASK,
+      taskFingerprint: CLOSED_HASH,
+      dispatchId: `${CLOSED_TASK}#0`,
+      attempt: 0,
+      source: "relay",
+    });
+    await log.append({
+      event: "SEND_CONFIRMED",
+      taskId: CLOSED_TASK,
+      taskFingerprint: CLOSED_HASH,
+      dispatchId: `${CLOSED_TASK}#0`,
+      attempt: 0,
+      source: "relay",
+    });
+    await log.append({ event: "TASK_REQUEUED", taskId: CLOSED_TASK, taskFingerprint: "*", source: "relay" });
+
+    /*
+     * The production assembly, written out: what `src/index.ts` passes is the
+     * relay itself, so the only thing standing between an operator and the
+     * relay is the structural check on this line.
+     */
+    const wired: RuntimeControl = relay;
+    expect(wired).toBe(relay);
+
+    // Records the call through the real method, without replacing it.
+    const seen: string[] = [];
+    const canonical = relay.closeReconciledTaskWithoutResend.bind(relay);
+    relay.closeReconciledTaskWithoutResend = async (input) => {
+      seen.push(`close:${input.taskId}`);
+      return canonical(input);
+    };
+
+    const production = await startControlServer({ control: relay, secret: SECRET, port: 0 });
+
+    try {
+      const response = await fetch(
+        `${production.url}/control/reconciliation/close` +
+          `?taskId=${CLOSED_TASK}&disposition=close_without_resend` +
+          `&reason=WorkBuddy%20already%20ran%20it`,
+        { method: "POST", headers: { [SECRET_HEADER]: SECRET } },
+      );
+
+      /*
+       * A 501 here would mean the transport is calling a name the relay does
+       * not have - the failure this test exists to make impossible.
+       */
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true });
+    } finally {
+      await production.close();
+      await relay.dispose();
+    }
+
+    expect(seen).toEqual([`close:${CLOSED_TASK}`]);
+
+    const raw = await readFile(join(dir, "ledger.jsonl"), "utf8");
+    const rows = raw
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+    const closure = rows.find((row) => row.event === "RECONCILIATION_RESOLVED");
+    expect(closure).toMatchObject({
+      taskId: CLOSED_TASK,
+      taskFingerprint: "*",
+    });
+    expect(
+      (closure?.detail as { disposition?: unknown } | undefined)?.disposition,
+    ).toBe("close_without_resend");
+
+    // Nothing moved: no second send, no invented completion, no new requeue.
+    expect(rows.filter((row) => row.event === "DISPATCH_STARTED")).toHaveLength(1);
+    expect(rows.filter((row) => row.event === "TASK_REQUEUED")).toHaveLength(1);
+    expect(rows.filter((row) => row.event === "TASK_COMPLETED")).toHaveLength(0);
+    expect(rows.filter((row) => row.event === "TASK_ENQUEUED")).toHaveLength(0);
+    expect(rows.filter((row) => row.event === "RESULT_RECEIVED")).toHaveLength(0);
+    expect(rows.filter((row) => row.event === "RESULT_ACKED")).toHaveLength(0);
+
+    expect(relay.status().pending).toEqual([]);
+    expect(relay.status().currentTask).toBeNull();
   });
 });

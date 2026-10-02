@@ -22,7 +22,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { AppConfig } from "../src/config.js";
 import type { AuditLog } from "../src/audit.js";
 import type { BridgeServer } from "../src/bridge-server.js";
-import { SECRET_HEADER, startControlServer, type RuntimeControl } from "../src/control.js";
+import { SECRET_HEADER, startControlServer } from "../src/control.js";
 import { ReconciliationService, TaskLedger } from "../src/reconciliation/index.js";
 import { ZhixingRelay } from "../src/relay.js";
 import { RelayStore } from "../src/store.js";
@@ -645,7 +645,14 @@ async function controlStatus(
   h: Awaited<ReturnType<typeof makeHarness>>,
 ): Promise<Record<string, unknown>> {
   const server = await startControlServer({
-    control: h.relay as unknown as RuntimeControl,
+    /*
+     * The relay itself, not a cast of it: `src/index.ts` passes the relay
+     * object, so this assembly is what production does and the compiler is
+     * what proves the relay still answers every method the transport calls.
+     * An `as unknown as RuntimeControl` here would have hidden the rename
+     * that turned the historical close into a runtime 501.
+     */
+    control: h.relay,
     secret: CONTROL_SECRET,
     // Port 0: the OS picks, so two cases can never collide on 8788.
     port: 0,
