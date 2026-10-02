@@ -36,6 +36,10 @@ temp/
 .vscode/
 .idea/
 
+# WorkBuddy's own session files in this working tree. They are not the
+# project's state and must never be committed, so they are not part of it.
+/.workbuddy/
+
 # OS
 .DS_Store
 Thumbs.db

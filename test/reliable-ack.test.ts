@@ -39,6 +39,15 @@ import {
 type Delivery = "confirmed" | "input_mismatch" | "click_only" | "wrong_task";
 /** What the fake page says about the turn it was handed. */
 type Running = "running" | "result_ready" | "cancelled" | "timeout";
+/**
+ * The wait window, and how long the fake waits before it runs out.
+ *
+ * A real two hour window cannot be waited out in a test, so the fake fails the
+ * wait after this many milliseconds with the very error the real adapter
+ * produces at the end of `WORKBUDDY_MAX_WAIT_MS` - the message has to match,
+ * because that string is what classifies the failure.
+ */
+type WaitWindow = { budgetMs: number; failsAfterMs: number };
 
 const RESULT_BODY = "the gate passed";
 
@@ -104,6 +113,8 @@ type Knobs = {
   runningDelayMs: number;
   /** False for a Chrome bridge that is not on the other end. */
   connected: boolean;
+  /** Set for a turn that is still working when the wait window runs out. */
+  waitWindow: WaitWindow | null;
 };
 
 /** The bookkeeping one fake WorkBuddy keeps for the relay talking to it. */
@@ -114,6 +125,8 @@ type FakeWorkbuddy = {
   clicks: number;
   /** Set while a turn is hanging on the answer. */
   resolver: ((text: string) => void) | null;
+  /** Set to make the answer wait run out while WorkBuddy is still working. */
+  waitWindow: WaitWindow | null;
 };
 
 const sleep = (ms: number): Promise<void> =>
@@ -225,6 +238,27 @@ function buildWorkbuddy(share: FakeWorkbuddy, knobs: Knobs): {
       },
       waitForAssistantReply: () => {
         state.waitCalls += 1;
+
+        /*
+         * The two hour accident: WorkBuddy is already running the task and
+         * never answers inside the window. The failure has to look like the
+         * real one, because the whole point is what the relay does with the
+         * error, not with a stand-in for it.
+         */
+        if (state.waitWindow !== null) {
+          return new Promise((_resolve, reject) => {
+            setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `Timed out waiting WorkBuddy after ${state.waitWindow?.budgetMs}ms`,
+                  ),
+                ),
+              state.waitWindow?.failsAfterMs ?? 1,
+            );
+          });
+        }
+
         return new Promise((resolve) => {
           // Whatever the page answers has to come back verbatim: an answer that
           // is silently replaced by a canned one cannot be told apart from one
@@ -242,6 +276,8 @@ type Replay = {
   relay: ZhixingRelay;
   sentToChatGpt: string[];
   sentToWorkBuddy: string[];
+  /** True once the recovered round is listening for the answer. */
+  waiting?: () => boolean;
   answerWith: (text: string) => void;
   push: (message: unknown) => Promise<void>;
 };
@@ -262,6 +298,8 @@ type Harness = {
   autoAck: boolean;
   /** Off is a Chrome bridge that is not there. */
   connected: boolean;
+  /** Makes the answer wait run out while WorkBuddy is still working. */
+  waitWindow: WaitWindow | null;
   waitCalls: number;
   /** True once the relay is hanging on the answer of this task. */
   waiting: () => boolean;
@@ -325,6 +363,7 @@ async function makeHarness(): Promise<Harness> {
     running: "running",
     runningDelayMs: 0,
     connected: true,
+    waitWindow: null,
   };
   const h = {
     auditEvents,
@@ -339,6 +378,7 @@ async function makeHarness(): Promise<Harness> {
     waitCalls: 0,
     clicks: 0,
     resolver: null,
+    waitWindow: knobs.waitWindow,
   };
 
   Object.defineProperty(h, "clicks", { get: () => main.clicks });
@@ -365,6 +405,14 @@ async function makeHarness(): Promise<Harness> {
     get: () => knobs.connected,
     set: (value: boolean) => {
       knobs.connected = value;
+    },
+  });
+  Object.defineProperty(h, "waitWindow", {
+    get: () => knobs.waitWindow,
+    set: (value: WaitWindow | null) => {
+      knobs.waitWindow = value;
+      // Both fakes read the window, so a restart sees the same one.
+      main.waitWindow = value;
     },
   });
 
@@ -534,6 +582,7 @@ async function makeHarness(): Promise<Harness> {
       waitCalls: 0,
       clicks: 0,
       resolver: null,
+      waitWindow: knobs.waitWindow,
     };
     const freshWorkbuddy = buildWorkbuddy(fresh, knobs);
 
@@ -565,6 +614,7 @@ async function makeHarness(): Promise<Harness> {
       relay: freshRelay,
       sentToChatGpt: freshSent,
       sentToWorkBuddy: freshWorkbuddySent,
+      waiting: () => fresh.resolver !== null,
       answerWith: (text: string) => freshWorkbuddy.answer(text),
       push,
     };
@@ -731,6 +781,7 @@ describe("running confirmation", () => {
 
     expect(await h.history("t-running")).toEqual([
       "TASK_PUBLISHED",
+      "TASK_ACCEPTED",
       "DISPATCH_STARTED",
       "INPUT_CONFIRMED",
       "SEND_CONFIRMED",
@@ -1028,6 +1079,159 @@ describe("restart recovery", () => {
     // ...and WorkBuddy was never asked to do the work a second time.
     expect(replay.sentToWorkBuddy).toHaveLength(0);
     expect(h.store.snapshot().currentTask).toBeNull();
+  });
+});
+
+/**
+ * The two hour accident this repair exists for.
+ *
+ * WorkBuddy had taken the task and was working on it; the answer never
+ * arrived inside the window. The instinct of a turn loop is to retry, and a
+ * retry here typed the user's request into WorkBuddy a second time, while the
+ * first turn - which had not finished - was still going. A wait that runs out
+ * is therefore not a failed send: it is a fact about a task that may already
+ * be running somewhere.
+ */
+describe("a result wait that runs out after WorkBuddy already had the task", () => {
+  it("freezes the round instead of requeuing it, and never sends a second time", async () => {
+    const h = await makeHarness();
+
+    /*
+     * The real window is two hours; the fake names the same number in the
+     * error so the classification under test is the production one, but it
+     * gives up quickly so the case does not have to wait for it.
+     */
+    h.waitWindow = { budgetMs: 7_200_000, failsAfterMs: 15 };
+    // WorkBuddy is definitely working on the payload before the wait runs out.
+    h.running = "running";
+
+    await h.startTask("t-slow");
+
+    await flushUntil(
+      () => h.auditEvents.some((event) => event.event === "workbuddy_wait_failed"),
+      3000,
+      "the wait to run out",
+    );
+
+    // The failure is recorded as a freeze, not as a failure that earned a retry.
+    const frozen = h.auditEvents.find((event) => event.event === "workbuddy_wait_failed");
+    expect(frozen?.payload.action).toBe("frozen_for_human_decision");
+    expect(frozen?.payload.error).toContain("Timed out waiting WorkBuddy after 7200000ms");
+
+    /*
+     * Nothing moved on: no requeue was written, so the queue stays empty and
+     * the turn was not handed back to a router that would send it again.
+     */
+    expect(h.auditEvents.some((event) => event.event === "task_requeued")).toBe(false);
+    expect(h.auditEvents.some((event) => event.event === "workbuddy_turn_failed")).toBe(false);
+    expect(h.store.snapshot().pending).toHaveLength(0);
+
+    /*
+     * The original dispatch is untouched. A freeze keeps the evidence a human
+     * needs - which task, which dispatch, which message, which stage - so a
+     * second dispatch cannot be confused with the first one.
+     */
+    const held = h.store.snapshot().currentTask;
+    expect(held?.taskId).toBe("t-slow");
+    expect(held?.dispatchId).toBe("t-slow#0");
+    expect(held?.workbuddyOutboundMessageId).toBe("turn-t-slow");
+    expect(held?.execution?.stage).toBe("RECONCILIATION_REQUIRED");
+
+    // One send, one click, one wait: the task was never dispatched twice.
+    expect(h.sentToWorkBuddy.filter((text) => text.includes("t-slow"))).toHaveLength(1);
+    expect(h.clicks).toBe(1);
+    expect(h.waitCalls).toBe(1);
+
+    // scheduling is not left holding anything the next task may trip over
+    expect(h.auditEvents.some((event) => event.event === "dispatch_unconfirmed")).toBe(false);
+
+    /*
+     * The ledger shows the same story: the chain reaches the point of no
+     * return and stops there. No requeue line, and no second dispatch.
+     */
+    const history = await h.history("t-slow");
+
+    expect(history.indexOf("SEND_CONFIRMED")).toBeGreaterThanOrEqual(0);
+    expect(history.indexOf("RUNNING_CONFIRMED")).toBeGreaterThan(history.indexOf("SEND_CONFIRMED"));
+    expect(history).toContain("DISPATCH_STALLED");
+
+    expect(history).not.toContain("TASK_REQUEUED");
+    expect(history).not.toContain("TASK_ENQUEUED");
+    expect(history).not.toContain("DISPATCH_RETRY");
+
+    /*
+     * And the freeze holds the line for the next task: a round that is still
+     * in flight owns the schedule, so a new task waits instead of overwriting
+     * the record the human is about to read.
+     */
+    await h.raw({
+      type: "chatgpt_assistant_message",
+      text: taskBlock("t-after-freeze"),
+      fingerprint: "fp-after",
+    });
+
+    await flushUntil(
+      () => h.store.snapshot().pending.some((item) => item.text.includes("t-after-freeze")),
+      3000,
+      "the next task to wait its turn",
+    );
+
+    expect(h.sentToWorkBuddy.filter((text) => text.includes("t-slow"))).toHaveLength(1);
+    expect(stageOf(h)).toBe("RECONCILIATION_REQUIRED");
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-slow");
+  });
+
+  it("keeps the frozen dispatch's evidence when the relay restarts", async () => {
+    const h = await makeHarness();
+    h.waitWindow = { budgetMs: 7_200_000, failsAfterMs: 15 };
+    h.running = "running";
+
+    await h.startTask("t-slow-restart");
+    await flushUntil(
+      () => h.auditEvents.some((event) => event.event === "workbuddy_wait_failed"),
+      3000,
+      "the wait to run out",
+    );
+
+    const before = h.store.snapshot().currentTask;
+    expect(before?.execution?.stage).toBe("RECONCILIATION_REQUIRED");
+
+    /*
+     * The window is cleared for the replay, so the resumed wait can actually
+     * hear the answer: what is being tested is that the restart went back to
+     * the ALREADY SENT message, not that the task was sent again.
+     */
+    h.waitWindow = null;
+
+    const replay = await h.restart();
+    await replay.relay.resume();
+
+    /*
+     * A restarted relay reads the durable record, not a status string the
+     * freeze happened to write: the task is mid-flight in WorkBuddy, so the
+     * only honest move is to wait for that very message. The task text must
+     * never appear in sendText again.
+     */
+    await flushUntil(() => replay.waiting?.() === true, 3000, "the recovered wait to start");
+
+    expect(replay.sentToWorkBuddy.filter((text) => text.includes("t-slow-restart"))).toHaveLength(0);
+
+    // The evidence a human would have to read is still the original one.
+    const after = h.store.snapshot().currentTask;
+    expect(after?.taskId).toBe("t-slow-restart");
+    expect(after?.dispatchId).toBe(before?.dispatchId);
+    expect(after?.workbuddyOutboundMessageId).toBe(before?.workbuddyOutboundMessageId);
+
+    // The recovered wait listens to the original message and delivers once.
+    replay.answerWith(RESULT_BODY);
+
+    await flushUntil(
+      () => replay.sentToChatGpt.filter((text) => text.includes("TYPE: RESULT")).length === 1,
+      3000,
+      "the recovered answer to be delivered",
+    );
+
+    expect(replay.sentToChatGpt.filter((text) => text.includes("TYPE: RESULT"))).toHaveLength(1);
   });
 });
 
