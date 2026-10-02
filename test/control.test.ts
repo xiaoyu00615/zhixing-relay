@@ -200,11 +200,18 @@ describe("control routes", () => {
     expect(Object.keys(body).sort()).toEqual(
       [
         "bridge",
+        "currentAttempt",
+        "currentDispatchId",
         "currentTask",
+        "executionLastProgressAt",
+        "executionStage",
+        "executionStageStartedAt",
         "heartbeat",
+        "ledgerEventCount",
         "ok",
         "pending",
         "paused",
+        "reconciliationHold",
         "state",
         "workbuddy",
         "uptime",

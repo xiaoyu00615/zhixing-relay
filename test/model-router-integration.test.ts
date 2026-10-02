@@ -16,9 +16,49 @@ import { ZhixingRelay } from "../src/relay.js";
 import { RelayStore } from "../src/store.js";
 import { wrapWorkBuddyResult } from "../src/protocol.js";
 import type { ExtensionInbound, PendingItem } from "../src/types.js";
-import type { WorkBuddyClient } from "../src/workbuddy.js";
+import type { WorkBuddyClient, SendAck } from "../src/workbuddy.js";
 import { WorkBuddyModelError } from "../src/workbuddy/model.js";
 import { AVAILABLE_DETECTION, type QuotaDetection } from "../src/workbuddy/quota.js";
+import {
+  confirmInputReadback,
+  confirmSend,
+  type RunningConfirmation,
+  type TurnSnapshot,
+} from "../src/workbuddy/turn-ack.js";
+
+/** A send the fake adapter can prove: input read back, new turn observed. */
+function confirmedAck(outboundId: string): SendAck {
+  return {
+    outboundId,
+    input: {
+      ok: true,
+      reason: "confirmed",
+      expectedFingerprint: "fp-sent",
+      observedFingerprint: "fp-sent",
+      expectedLength: 0,
+      observedLength: 0,
+      exactMatch: true,
+      normalizedMatch: true,
+    },
+    send: {
+      ok: true,
+      reason: "confirmed",
+      observedMessageId: outboundId,
+      beforeTurnCount: 1,
+      afterTurnCount: 2,
+      detail: "a new turn carrying this task is on the page",
+    },
+    clickOk: true,
+  };
+}
+
+/** What WorkBuddy reports once the send has really reached it. */
+const RUNNING: RunningConfirmation = {
+  outcome: "running",
+  ok: true,
+  reason: "processing",
+  evidence: { running: true, completed: false, cancelled: false },
+};
 
 const IDS = {
   hy4: "hy4-preview",
@@ -69,9 +109,10 @@ type Call = {
     | "router.pin"
     | "workbuddy.getCurrentModel"
     | "workbuddy.selectModel"
-    | "workbuddy.sendText"
-    | "workbuddy.wait"
-    | "workbuddy.detectQuota";
+  | "workbuddy.sendText"
+  | "workbuddy.wait"
+  | "workbuddy.detectQuota";
+
   label?: string;
 };
 
@@ -103,6 +144,18 @@ type Harness = {
   selectModelError: WorkBuddyModelError | null;
   /** Injected failure for handing the text to WorkBuddy. */
   sendTextError: string | null;
+  /**
+   * How the fake page answers the delivery confirmations.
+   *
+   * `click_only` is the case that matters most: the send button was clicked
+   * and nothing else is provable, which must never be reported as a success.
+   */
+  delivery: "confirmed" | "input_mismatch" | "click_only" | "wrong_task";
+  /**
+   * What the page looks like while the turn is being confirmed as running.
+   * `none` means the relay never gets to look, because an earlier step failed.
+   */
+  running: "running" | "result_ready" | "cancelled" | "timeout";
   /**
    * Quota verdict injected into the first turn that finishes. Cleared as soon
    * as it is consumed, so a retry always resolves on the second attempt -
@@ -136,6 +189,15 @@ type Harness = {
   callsFor: (id: number) => Call[];
   /** How many wait resolvers `id` still owns. */
   waitHooksFor: (id: number) => number;
+  /**
+   * Whether the fake extension acknowledges a RESULT it delivered.
+   *
+   * Off, a delivered answer stays in `RESULT_DELIVERED`, which is the only way
+   * to tell delivery and acknowledgement apart.
+   */
+  autoAck: boolean;
+  /** Acknowledges the answer the extension most recently delivered. */
+  ackResult: (requestId?: string) => Promise<void>;
   /** Pushes an inbound bridge message of any shape straight to the relay. */
   raw: (message: unknown) => Promise<void>;
   /** Pushes a ChatGPT user message (a human paste, or the RESULT returning). */
@@ -163,7 +225,12 @@ afterAll(async () => {
     maxRetries: 5,
     retryDelay: 10,
   });
-});
+  /*
+   * The removal itself is slow here: the recursive delete of a few hundred
+   * small files takes longer than the default ten seconds, which would report
+   * the suite as failing while every test in it had passed.
+   */
+}, 60_000);
 
 afterEach(async () => {
   // No global hook registry to drain any more: every wait resolver lives on
@@ -240,6 +307,9 @@ async function makeHarness(
     currentModel: "Hy4 preview",
     selectModelError: null,
     sendTextError: null,
+    delivery: "confirmed",
+    running: "running",
+    autoAck: true,
     waitOutcome: null,
     routerThrow: null,
     bridgeConnected: true,
@@ -253,8 +323,29 @@ async function makeHarness(
     onMessage: (handler: (message: ExtensionInbound) => Promise<void>) => {
       messageHandler = handler;
     },
-    send: async (message: { text: string }) => {
-      sentToChatGpt.push(message.text);
+    send: async (message: { text: string; type?: string; requestId?: string }) => {
+      // Not every bridge message carries text; only those can be a RESULT.
+      if (typeof message.text === "string") sentToChatGpt.push(message.text);
+
+      /*
+       * A real extension confirms a RESULT it injected by sending
+       * `chatgpt_send_result` back. The fake does the same, which is what
+       * closes the round and records RESULT_ACKED instead of leaving the
+       * relay waiting on a delivery that already happened.
+       */
+      if (message.type === "send_to_chatgpt") {
+        /*
+         * The extension answers on its own schedule, and the answer is about a
+         * delivery the relay has to have recorded first. The fake therefore
+         * waits for the record to say `sent_to_gpt`, so it can never ack a
+         * delivery that has not happened yet.
+         */
+        const waiter = setInterval(() => {
+          if (store.snapshot().currentTask?.status !== "sent_to_gpt") return;
+          clearInterval(waiter);
+          if (h.autoAck) ackSend(messageHandler, message.requestId);
+        }, 2);
+      }
     },
     close: async () => {},
     start: async () => {},
@@ -273,11 +364,82 @@ async function makeHarness(
       h.currentModel = label;
       return { changed: true, previous: null, current: label };
     },
-    sendText: async (text: string) => {
+    /*
+     * The fake answers the three confirmations the same way the CDP adapter
+     * does: input is read back, and a send only counts when the page grew a
+     * NEW turn carrying this task. A click alone is never enough.
+     */
+    sendText: async (text: string, context: { taskId: string }) => {
       record("workbuddy.sendText");
       sentToWorkBuddy.push(text);
       if (h.sendTextError) throw new Error(h.sendTextError);
-      return "wb-1";
+
+      const input = confirmInputReadback({
+        expected: text,
+        observed: h.delivery === "input_mismatch" ? `${text} (tampered)` : text,
+      });
+
+      if (!input.ok) {
+        return {
+          outboundId: "wb-1",
+          input,
+          send: {
+            ok: false,
+            reason: "input_not_confirmed",
+            observedMessageId: null,
+            beforeTurnCount: 0,
+            afterTurnCount: 0,
+            detail: "the payload never reached the composer",
+          },
+          clickOk: false,
+        };
+      }
+
+      const snapshot = (turns: TurnSnapshot["turns"]): TurnSnapshot => ({
+        inputText: text,
+        turns,
+      });
+
+      const before = snapshot([{ signature: "turn-before", containsTaskId: false }]);
+
+      let after: TurnSnapshot;
+
+      switch (h.delivery) {
+        // The button was clicked and no new turn appeared at all.
+        case "click_only":
+          after = snapshot([{ signature: "turn-before", containsTaskId: false }]);
+          break;
+        // A new turn appeared, but it is a different task.
+        case "wrong_task":
+          after = snapshot([{ signature: "turn-other", containsTaskId: false }]);
+          break;
+        default:
+          after = snapshot([
+            { signature: "turn-before", containsTaskId: false },
+            { signature: `turn-${context.taskId}`, containsTaskId: true },
+          ]);
+      }
+
+      return {
+        outboundId: "wb-1",
+        input,
+        send: confirmSend({ before, after, expectedTaskId: context.taskId }),
+        clickOk: true,
+      };
+    },
+    waitForRunning: async (): Promise<RunningConfirmation> => {
+      const evidence = { running: false, completed: false, cancelled: false };
+
+      switch (h.running) {
+        case "running":
+          return { outcome: "running", ok: true, reason: "processing", evidence: { ...evidence, running: true } };
+        case "result_ready":
+          return { outcome: "result_ready", ok: false, reason: "already finished", evidence: { ...evidence, completed: true } };
+        case "cancelled":
+          return { outcome: "cancelled", ok: false, reason: "the turn was cancelled", evidence: { ...evidence, cancelled: true } };
+        default:
+          return { outcome: "timeout", ok: false, reason: "nothing moved", evidence };
+      }
     },
     waitForAssistantReply: async () => {
       record("workbuddy.wait");
@@ -341,6 +503,17 @@ async function makeHarness(
       quotaRetries: 2,
       quotaBlockMs: 3_600_000,
     },
+    workbuddy: {
+      // Small enough that the confirmation windows never slow a test down.
+      pollIntervalMs: 10,
+      sendConfirmTimeoutMs: 200,
+      runningConfirmTimeoutMs: 500,
+    },
+    /*
+     * A real ledger, so the relay runs with reconciliation attached and the
+     * acknowledgement stages it writes are the ones a restart would read.
+     */
+    paths: { ledger: pathToFileURL(join(dir, "ledger.jsonl")) },
   } as unknown as AppConfig;
 
   // Trace select/pin on the real router so the assertions observe the true
@@ -475,6 +648,11 @@ async function makeHarness(
   h.waitHooksFor = (id: number) =>
     records.find((r) => r.id === id)?.waitHooks.length ?? 0;
 
+  /** Acknowledges the delivery the extension has just made. */
+  h.ackResult = async (requestId = "req-ack"): Promise<void> => {
+    await h.raw({ type: "chatgpt_send_result", requestId, ok: true, sent: true });
+  };
+
   /** Feeds an inbound message of any shape, including ones the union omits. */
   h.raw = async (message: unknown): Promise<void> => {
     if (!messageHandler) throw new Error("bridge handler was never registered");
@@ -501,6 +679,33 @@ function timeline(calls: Call[]): string[] {
     }
   });
 }
+
+/**
+ * A fake extension acknowledging a RESULT delivery.
+ *
+ * The acknowledgement travels on a macrotask on purpose: the relay records the
+ * delivery first and only then moves the record to `sent_to_gpt`, so an ack
+ * fired inside the same tick would arrive before the delivery existed.
+ */
+function ackSend(
+  handler: ((message: ExtensionInbound) => Promise<void>) | null,
+  requestId?: string,
+): void {
+  setTimeout(() => {
+    void handler?.({
+      type: "chatgpt_send_result",
+      requestId: requestId ?? null,
+      ok: true,
+      sent: true,
+    });
+  }, 0);
+}
+
+/**
+ * Where a "restarted" relay parks its extension handler, so the test can
+ * acknowledge the RESULT the way the extension would.
+ */
+let freshInbound: ((message: ExtensionInbound) => Promise<void>) | null = null;
 
 async function flushUntil(
   predicate: () => boolean,
@@ -632,6 +837,12 @@ describe("model router <> relay integration", () => {
     expect(h.store.snapshot().currentTask).toBeNull();
   });
 
+  /*
+   * v0.4.7: a turn that reports a cancellation after WorkBuddy was already
+   * running is evidence, not a retry. The send really happened, so sending the
+   * task again could run it twice - the record stays put and the pin is still
+   * released, because nobody is waiting for this turn any more.
+   */
   it("releases the pin when the WorkBuddy wait fails", async () => {
     const h = await makeHarness();
     h.currentModel = "GLM-5.3-Flash";
@@ -640,7 +851,12 @@ describe("model router <> relay integration", () => {
     await h.sendTask("t-wait-fail");
 
     expect(h.router.pinnedModelId()).toBeNull();
-    expect(h.store.snapshot().currentTask).toBeNull();
+    expect(h.calls.some((c) => c.kind === "workbuddy.sendText")).toBe(true);
+    expect(h.store.snapshot().pending).toHaveLength(0);
+    expect(h.store.snapshot().currentTask?.taskId).toBe("t-wait-fail");
+    expect(h.store.snapshot().currentTask?.execution?.stage).toBe(
+      "RECONCILIATION_REQUIRED",
+    );
   });
 
   it("releases the pin after a normal RESULT round trip", async () => {
@@ -821,10 +1037,13 @@ describe("model router <> relay integration", () => {
           gptForwardMode: "tagged",
           autoSendToChatGPT: true,
         },
+        workbuddy: { pollIntervalMs: 10, sendConfirmTimeoutMs: 50, runningConfirmTimeoutMs: 500 },
       } as unknown as AppConfig,
       {
         hasClient: () => true,
-        onMessage: () => {},
+        onMessage: (handler: (message: ExtensionInbound) => Promise<void>) => {
+          freshInbound = handler;
+        },
         send: async () => {},
         close: async () => {},
       } as unknown as BridgeServer,
@@ -836,6 +1055,7 @@ describe("model router <> relay integration", () => {
         getCurrentModel: async () => "Hy3",
         selectModel: async () => ({ changed: false, previous: "Hy3", current: "Hy3" }),
         sendText: async () => "wb-1",
+        waitForRunning: async () => RUNNING,
         waitForAssistantReply: () => new Promise(() => {}),
       } as unknown as WorkBuddyClient,
       freshRouter,
@@ -874,13 +1094,21 @@ describe("model router <> relay integration", () => {
           gptForwardMode: "tagged",
           autoSendToChatGPT: true,
         },
+        workbuddy: { pollIntervalMs: 10, sendConfirmTimeoutMs: 50, runningConfirmTimeoutMs: 500 },
       } as unknown as AppConfig,
       {
         hasClient: () => true,
-        onMessage: () => {},
+        onMessage: (handler: (message: ExtensionInbound) => Promise<void>) => {
+          freshInbound = handler;
+        },
         // The RESULT the recovered turn forwards has to be observable here.
-        send: async (message: { text: string }) => {
+        send: async (message: { text: string; requestId?: string }) => {
           h.sentToChatGpt.push(message.text);
+          const waiter = setInterval(() => {
+            if (h.store.snapshot().currentTask?.status !== "sent_to_gpt") return;
+            clearInterval(waiter);
+            ackSend(freshInbound, message.requestId);
+          }, 2);
         },
         close: async () => {},
       } as unknown as BridgeServer,
@@ -897,8 +1125,9 @@ describe("model router <> relay integration", () => {
         }),
         sendText: async (text: string) => {
           sent.push(text);
-          return "wb-1";
+          return confirmedAck("wb-1");
         },
+        waitForRunning: async () => RUNNING,
         // Answers at once, the way an already-finished round would.
         waitForAssistantReply: async () => ({
           text: "RESULT BODY",
@@ -962,13 +1191,21 @@ describe("model router <> relay integration", () => {
           gptForwardMode: "tagged",
           autoSendToChatGPT: true,
         },
+        workbuddy: { pollIntervalMs: 10, sendConfirmTimeoutMs: 50, runningConfirmTimeoutMs: 500 },
       } as unknown as AppConfig,
       {
         hasClient: () => true,
-        onMessage: () => {},
+        onMessage: (handler: (message: ExtensionInbound) => Promise<void>) => {
+          freshInbound = handler;
+        },
         // The RESULT the recovered turn forwards has to be observable here.
-        send: async (message: { text: string }) => {
+        send: async (message: { text: string; requestId?: string }) => {
           h.sentToChatGpt.push(message.text);
+          const waiter = setInterval(() => {
+            if (h.store.snapshot().currentTask?.status !== "sent_to_gpt") return;
+            clearInterval(waiter);
+            ackSend(freshInbound, message.requestId);
+          }, 2);
         },
         close: async () => {},
       } as unknown as BridgeServer,
@@ -984,8 +1221,9 @@ describe("model router <> relay integration", () => {
         },
         sendText: async (text: string) => {
           sent.push(text);
-          return "wb-2";
+          return confirmedAck("wb-2");
         },
+        waitForRunning: async () => RUNNING,
         waitForAssistantReply: () =>
           new Promise((resolve) => {
             pendingWaits.push(() => resolve(answer()));
@@ -1163,11 +1401,11 @@ describe("model router <> relay integration", () => {
     expect(pending).toHaveLength(0);
 
     /*
-     * The round is closed the moment its RESULT reaches ChatGPT, even after a
-     * retry, so the identity of the task is carried by the forwarded text and
-     * the audit trail - not by a task record nobody is waiting for any more.
+     * The round closes when the answer is acknowledged, even after a retry, so
+     * the identity of the task is carried by the forwarded text and the audit
+     * trail - not by a task record nobody is waiting for any more.
      */
-    expect(h.store.snapshot().currentTask).toBeNull();
+    await flushUntil(() => h.store.snapshot().currentTask === null);
     expect(h.store.snapshot().state).toBe("IDLE");
     const forwarded = h.sentToChatGpt.find((text) => text.includes("attempt 1"));
     expect(forwarded).toContain("TASK_ID: t-quota-same-id");
@@ -1283,9 +1521,12 @@ describe("model router <> relay integration", () => {
     expect(h.sentToChatGpt.some((text) => text.includes("probe failed"))).toBe(true);
   });
 
-  it("releases the task the moment the RESULT reaches ChatGPT", async () => {
+  it("releases the task the moment the RESULT is acknowledged by ChatGPT", async () => {
     const h = await makeHarness();
     h.waitOutcome = { ok: true, text: "gate passed" };
+    // The acknowledgement is issued by hand below, so the state of a delivered
+    // but unacknowledged answer is observable.
+    h.autoAck = false;
 
     // An answer waiting behind the round that is about to finish.
     await h.store.enqueue({
@@ -1302,9 +1543,14 @@ describe("model router <> relay integration", () => {
     // The RESULT went out exactly once.
     expect(h.sentToChatGpt.filter((text) => text.includes("gate passed"))).toHaveLength(1);
 
-    // ...and with it the task record nobody is waiting for any more.
-    expect(h.store.snapshot().currentTask).toBeNull();
-    expect(h.store.snapshot().state).toBe("IDLE");
+    /*
+     * Delivery is not yet completion: the bridge sent the text, and the record
+     * is still held until the extension says ChatGPT took it. Releasing here
+     * is what made a crashed delivery indistinguishable from an acknowledged
+     * one.
+     */
+    expect(h.store.snapshot().currentTask?.status).toBe("sent_to_gpt");
+    expect(h.store.snapshot().currentTask?.execution?.stage).toBe("RESULT_DELIVERED");
     expect(
       h.auditEvents.some(
         (e) =>
@@ -1312,7 +1558,24 @@ describe("model router <> relay integration", () => {
           e.payload.taskId === "t-release" &&
           e.payload.reason === "result_delivered",
       ),
+    ).toBe(false);
+
+    // The acknowledgement arrives, and with it the record nobody waits for.
+    await h.ackResult();
+    await flushUntil(() => h.store.snapshot().currentTask === null);
+    expect(h.store.snapshot().state).toBe("IDLE");
+    expect(
+      h.auditEvents.some(
+        (e) =>
+          e.event === "round_completed" &&
+          e.payload.taskId === "t-release" &&
+          e.payload.reason === "gpt_send_confirmed",
+      ),
     ).toBe(true);
+
+    // The close came from the extension's acknowledgement, not from the send.
+    const ack = h.auditEvents.find((e) => e.event === "chatgpt_send_result");
+    expect(ack?.payload).toMatchObject({ ok: true, sent: true });
 
     // A released round is an idle relay, so the queue moved on.
     expect(h.store.snapshot().pending).toHaveLength(0);
@@ -1432,11 +1695,33 @@ describe("model router <> relay integration", () => {
     expect(h.calls.some((call) => call.kind === "workbuddy.sendText")).toBe(false);
   });
 
-  it("puts a cancelled task back in the queue instead of losing it", async () => {
+  /*
+   * v0.4.7: WorkBuddy may report a cancellation long after it had already
+   * executed, so the relay no longer answers that with a retry. The task is
+   * neither lost nor re-sent: it is held as evidence for a human, and only an
+   * explicit resolution puts it back on the queue.
+   */
+  it("holds a cancelled task as evidence instead of losing or retrying it", async () => {
     const h = await makeHarness();
     h.waitOutcome = { ok: false, error: "WorkBuddy task cancelled" };
 
     await h.sendTask("t-cancelled");
+
+    // Nothing was queued: a retry here could have run the task twice.
+    expect(h.store.snapshot().pending).toHaveLength(0);
+    expect(h.sentToChatGpt.some((text) => text.includes("TYPE: RESULT"))).toBe(false);
+    expect(h.auditEvents.some((e) => e.event === "task_requeued")).toBe(false);
+    expect(h.router.pinnedModelId()).toBeNull();
+
+    // ...and the task was not dropped either: its record carries the doubt.
+    const held = h.store.snapshot().currentTask;
+    expect(held?.taskId).toBe("t-cancelled");
+    expect(held?.execution?.stage).toBe("RECONCILIATION_REQUIRED");
+    expect(held?.sourceText ?? "").toContain("TASK_ID: t-cancelled");
+
+    // A human, not the relay, decides the cancellation was a mistake.
+    const resolved = await h.relay.resolveReconciliation("WorkBuddy had already run it");
+    expect(resolved.ok).toBe(true);
 
     const queued = h.store.snapshot().pending as PendingItem[];
     expect(queued).toHaveLength(1);
@@ -1444,32 +1729,47 @@ describe("model router <> relay integration", () => {
       kind: "gpt_task",
       taskId: "t-cancelled",
       retryCount: 1,
-      reason: "WorkBuddy task cancelled",
+      reason: "reconciled: WorkBuddy had already run it",
     });
     expect(queued[0]?.text ?? "").toContain("TASK_ID: t-cancelled");
-
-    expect(h.sentToChatGpt.some((text) => text.includes("TYPE: RESULT"))).toBe(false);
-    expect(h.auditEvents.some((e) => e.event === "task_requeued")).toBe(true);
-    expect(h.router.pinnedModelId()).toBeNull();
+    expect(h.store.snapshot().currentTask).toBeNull();
   });
 
-  it("stops requeuing a task WorkBuddy always refuses", async () => {
+  /*
+   * v0.4.7: nothing is requeued after WorkBuddy cancelled mid-flight, so a task
+   * it always refuses cannot cycle for ever - it stays one held record, and a
+   * human is the only thing that puts it back on the queue.
+   */
+  it("never cycles a task WorkBuddy always refuses", async () => {
     const h = await makeHarness();
     h.waitOutcome = { ok: false, error: "WorkBuddy task cancelled" };
 
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      await h.sendTask("t-persistent");
-    }
+    await h.sendTask("t-persistent");
 
-    const queued = h.store.snapshot().pending as PendingItem[];
-    // Three requeues were allowed; the fourth attempt was refused.
-    expect(queued).toHaveLength(3);
-    expect(queued[2]).toMatchObject({ taskId: "t-persistent", retryCount: 3 });
+    expect(h.store.snapshot().pending).toHaveLength(0);
     expect(
       h.auditEvents.filter((e) => e.event === "task_requeued"),
-    ).toHaveLength(3);
-    expect(h.auditEvents.some((e) => e.event === "task_retry_exhausted")).toBe(true);
+    ).toHaveLength(0);
     expect(h.sentToChatGpt.some((text) => text.includes("TYPE: RESULT"))).toBe(false);
+
+    // One record, however often WorkBuddy refuses: never a second copy, never
+    // a retry the relay decided on its own, and scheduling froze.
+    const held = h.store.snapshot().currentTask;
+    expect(held?.taskId).toBe("t-persistent");
+    expect(held?.execution?.stage).toBe("RECONCILIATION_REQUIRED");
+    expect(h.relay.status().reconciliationHold).toBe(true);
+
+    // The only way back on the queue is a decision, and it happens once.
+    const resolved = await h.relay.resolveReconciliation("the cancellation was a false alarm");
+    expect(resolved.ok).toBe(true);
+    expect(h.store.snapshot().pending).toHaveLength(1);
+    expect(h.store.snapshot().pending[0]).toMatchObject({
+      taskId: "t-persistent",
+      retryCount: 1,
+    });
+
+    await h.relay.resolveReconciliation("one more time");
+    expect(h.store.snapshot().pending).toHaveLength(1);
   });
 
   it("treats a RESULT pasted into ChatGPT as the completion signal", async () => {
@@ -1547,6 +1847,9 @@ describe("model router <> relay integration", () => {
     h.waitOutcome = { ok: true };
 
     await h.sendTask("t-health");
+    // The round is acknowledged, so the record is gone by the time the beat
+    // is emitted: an "idle" relay must not be described as holding a task.
+    await flushUntil(() => h.store.snapshot().currentTask === null);
 
     const status = h.relay.status();
 
@@ -1597,6 +1900,7 @@ describe("model router <> relay integration", () => {
     h.waitOutcome = { ok: true };
 
     await h.sendTask("t-restart-idle");
+    await flushUntil(() => h.store.snapshot().currentTask === null);
 
     const result = await h.relay.requestRestart("after a code change");
 

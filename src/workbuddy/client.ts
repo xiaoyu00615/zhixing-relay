@@ -11,6 +11,7 @@ import {
   type WorkBuddyState,
   type WorkBuddyTurnSignals,
 } from "./turn-state.js";
+import { type TurnSnapshot } from "./turn-ack.js";
 
 export type { WorkBuddyState } from "./turn-state.js";
 export type { QuotaDetection, QuotaSignals } from "./quota.js";
@@ -101,6 +102,49 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+/*
+ * What the page currently contains, for the delivery acknowledgements.
+ *
+ * The relay only ever sees plain values out of this: turn signatures, whether
+ * a turn carries the task's id, and what the composer holds. Deciding what any
+ * of it *means* stays in turn-ack.ts, which is unit-testable.
+ *
+ * Selectors that matter:
+ *
+ *   [contenteditable="true"][role="textbox"]  the composer
+ *   .cr-agent                                 one rendered turn/message
+ *
+ * A turn signature is the rendered length plus the first characters of the
+ * turn's own text: enough to tell "the same turn as before the click" from "a
+ * new one", and it never carries the whole body out of the page.
+ */
+const TURN_SNAPSHOT_EXPRESSION = (taskId: string) => `
+  (() => {
+    const input = document.querySelector('[contenteditable="true"][role="textbox"]');
+    const turns = Array.from(document.querySelectorAll('.cr-agent'));
+
+    const observed = turns.map((el, index) => {
+      const text = String(el.innerText || '');
+      const signature = text.length + '|' + text.slice(0, 64);
+      return {
+        signature: signature,
+        containsTaskId: text.indexOf(${JSON.stringify(taskId)}) !== -1,
+        index: index,
+      };
+    });
+
+    return JSON.stringify({
+      inputText: String(input ? (input.innerText || '') : ''),
+      turnCount: observed.length,
+      turns: observed,
+    });
+  })()`;
+
+/** A snapshot with nothing rendered yet, so callers never see a missing page. */
+export function emptyTurnSnapshot(): TurnSnapshot {
+  return { inputText: "", turns: [] };
+}
+
 
 
 export class WorkBuddyClient {
@@ -145,23 +189,19 @@ export class WorkBuddyClient {
 
 
 
-  async sendMessage(
-    text:string
-  ):Promise<void>{
-
-
-    console.log(
-      "[WorkBuddy] inserting:",
-      text
-    );
-
-
+  /**
+   * Puts the task text into the composer.
+   *
+   * This is deliberately only the typing. Confirming it is a separate call,
+   * because the relay has to be able to refuse to click send when what came
+   * back out of the composer is not what went in.
+   */
+  async typeIntoComposer(text: string): Promise<{ ok: boolean; detail: string }> {
 
     const inputResult =
       await this.cdp.evaluate(`
 
       (()=>{
-
 
         const input =
           document.querySelector(
@@ -170,190 +210,116 @@ export class WorkBuddyClient {
 
 
         if(!input){
-
           return "INPUT_NOT_FOUND";
-
         }
 
-
-
         input.focus();
-
-
 
         const value =
           ${JSON.stringify(text)};
 
-
-
-
-        /*
-          Slate Editor 输入模拟
-        */
-
-
-
         input.dispatchEvent(
-          new KeyboardEvent(
-            "keydown",
-            {
-              key:"",
-              bubbles:true
-            }
-          )
+          new KeyboardEvent("keydown", { key:"", bubbles:true })
         );
 
-
-
         input.dispatchEvent(
-          new InputEvent(
-            "beforeinput",
-            {
-              bubbles:true,
-              inputType:"insertText",
-              data:value
-            }
-          )
+          new InputEvent("beforeinput", {
+            bubbles:true,
+            inputType:"insertText",
+            data:value
+          })
         );
 
-
-
         input.dispatchEvent(
-          new InputEvent(
-            "input",
-            {
-              bubbles:true,
-              inputType:"insertText",
-              data:value
-            }
-          )
+          new InputEvent("input", {
+            bubbles:true,
+            inputType:"insertText",
+            data:value
+          })
         );
 
-
-
         input.dispatchEvent(
-          new KeyboardEvent(
-            "keyup",
-            {
-              key:"",
-              bubbles:true
-            }
-          )
+          new KeyboardEvent("keyup", { key:"", bubbles:true })
         );
-
-
 
         return "INPUT_OK";
 
 
-
       })()
 
       `);
 
+    const ok = inputResult === "INPUT_OK";
 
+    return {
+      ok,
+      detail: ok ? "input accepted" : String(inputResult),
+    };
+  }
 
-    console.log(
-      "[WorkBuddy] input:",
-      inputResult
-    );
+  /** Reads what the composer currently holds, so it can be compared with intent. */
+  async readComposerText(): Promise<string> {
 
-
-
-    if(inputResult !== "INPUT_OK"){
-
-      throw new Error(
-        inputResult
-      );
-
-    }
-
-
-
-
-
-    const check =
+    const raw =
       await this.cdp.evaluate(`
 
-
       (()=>{
-
-
         const input =
           document.querySelector(
             '[contenteditable="true"][role="textbox"]'
           );
-
-
-
-        const button =
-          document.querySelector(
-            "button.cr-send-button"
-          );
-
-
-
-        return JSON.stringify({
-
-          text:
-            input?.innerText || "",
-
-
-          html:
-            input?.innerHTML || "",
-
-
-          disabled:
-            button?.disabled ?? null,
-
-
-          ariaDisabled:
-            button?.getAttribute(
-              "aria-disabled"
-            )
-
-        });
-
-
-
+        return String(input ? (input.innerText || '') : '');
       })()
-
 
       `);
 
+    return typeof raw === "string" ? raw : "";
+  }
 
+  /** What the page renders right now: the turns, and what each of them carries. */
+  async readTurnSnapshot(taskId: string): Promise<TurnSnapshot> {
 
-    console.log(
-      "[CHECK INPUT]",
-      check
-    );
+    const raw =
+      await this.cdp.evaluate(TURN_SNAPSHOT_EXPRESSION(taskId));
 
+    if (typeof raw !== "string") return emptyTurnSnapshot();
 
+    try {
+      const payload = JSON.parse(raw) as {
+        inputText?: unknown;
+        turnCount?: unknown;
+        turns?: unknown;
+      };
 
+      const turns = Array.isArray(payload.turns) ? payload.turns : [];
 
+      return {
+        inputText: typeof payload.inputText === "string" ? payload.inputText : "",
+        turns: turns.filter(
+          (turn): turn is TurnSnapshot["turns"][number] =>
+            typeof turn === "object" &&
+            turn !== null &&
+            typeof (turn as { signature?: unknown }).signature === "string",
+        ),
+      };
+    } catch {
+      return emptyTurnSnapshot();
+    }
+  }
 
-
-
-    await new Promise(
-      resolve =>
-        setTimeout(
-          resolve,
-          1500
-        )
-    );
-
-
-
-
-
-
+  /**
+   * Clicks the send button.
+   *
+   * `CLICK_OK` is the weakest fact available here and the caller is expected to
+   * treat it as such: a click that lands does not prove the message ever became
+   * a turn, which is why it is never returned as a send confirmation.
+   */
+  async clickSendButton(): Promise<{ clickOk: boolean; detail: string }> {
 
     const sendResult =
       await this.cdp.evaluate(`
 
-
       (()=>{
-
 
         const button =
           document.querySelector(
@@ -361,60 +327,22 @@ export class WorkBuddyClient {
           );
 
 
-
         if(!button){
-
           return "BUTTON_NOT_FOUND";
-
         }
 
-
-
-        console.log(
-          "[WorkBuddy] clicking send"
-        );
-
-
-
         button.dispatchEvent(
-          new MouseEvent(
-            "mousedown",
-            {
-              bubbles:true
-            }
-          )
+          new MouseEvent("mousedown", { bubbles:true })
         );
-
-
-
         button.dispatchEvent(
-          new MouseEvent(
-            "mouseup",
-            {
-              bubbles:true
-            }
-          )
+          new MouseEvent("mouseup", { bubbles:true })
         );
-
-
-
         button.dispatchEvent(
-          new MouseEvent(
-            "click",
-            {
-              bubbles:true
-            }
-          )
+          new MouseEvent("click", { bubbles:true })
         );
-
-
-
         button.click();
 
-
-
         return "CLICK_OK";
-
 
 
       })()
@@ -422,35 +350,26 @@ export class WorkBuddyClient {
 
       `);
 
+    const clickOk = sendResult === "CLICK_OK";
 
-
-
-    console.log(
-      "[WorkBuddy] send:",
-      sendResult
-    );
-
-
-
-    if(sendResult !== "CLICK_OK"){
-
-      throw new Error(
-        sendResult
-      );
-
-    }
-
-
-
+    return { clickOk, detail: clickOk ? "send clicked" : String(sendResult) };
   }
 
+  /**
+   * Types and clicks in one go.
+   *
+   * Kept for the standalone worker, which does not need acknowledgements. The
+   * relay uses typeIntoComposer / clickSendButton so it can confirm the input
+   * before the click and confirm the turn after it.
+   */
+  async sendMessage(text: string): Promise<void> {
 
+    const typed = await this.typeIntoComposer(text);
+    if (!typed.ok) throw new Error(typed.detail);
 
-
-
-
-
-
+    const clicked = await this.clickSendButton();
+    if (!clicked.clickOk) throw new Error(clicked.detail);
+  }
 
   async readMessage():Promise<string>{
 

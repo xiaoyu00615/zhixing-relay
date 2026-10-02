@@ -34,6 +34,16 @@ import {
   TaskLedger,
   taskFingerprint,
 } from "./reconciliation/index.js";
+import type { ReconciliationEventName } from "./reconciliation/types.js";
+import {
+  advanceStage,
+  createExecutionState,
+  isAlertStage,
+  isStaleDispatch,
+  type TaskExecutionStage,
+  type TaskExecutionState,
+} from "./delivery/stage.js";
+import { classifyTurnFailure } from "./workbuddy/turn-ack.js";
 
 /**
  * One routed turn: the model the router picked for this task. Kept next to
@@ -50,6 +60,24 @@ type RoutedModel = {
  * so it must not be requeued a second time.
  */
 class NoUsableModelError extends Error {}
+
+/**
+ * Thrown when the composer does not hold the payload before the click.
+ *
+ * Nothing reached WorkBuddy, so the task is still provably unsent and going
+ * back to the queue is safe. That is the only case where a retry may follow.
+ */
+class InputNotConfirmedError extends Error {}
+
+/**
+ * Thrown when WorkBuddy will not say whether the task was taken.
+ *
+ * The send click may already have happened, so a blind retry could duplicate a
+ * task that is running. The round is frozen with its evidence instead: the
+ * task record stays, nothing schedules, and only a reconciliation - or the
+ * operator who knows what actually happened - may move it on.
+ */
+class UnconfirmedDispatchError extends Error {}
 
 /**
  * The WAIT_GPT lease. One round at a time owns it; the timer is what frees a
@@ -81,6 +109,8 @@ export class ZhixingRelay {
   private readonly reconciliation: ReconciliationService | null;
   /** Reconciliation found a chain that must not be auto-sent any more. */
   private reconciliationHold = false;
+  /** Ledger size, refreshed on every write so `status` never reads the file. */
+  private ledgerEventCount: number | null = null;
   /** Answers to `fetch_recent_assistant_messages`, keyed by request id. */
   private recentMessageWaiters = new Map<
     string,
@@ -133,6 +163,10 @@ export class ZhixingRelay {
 
     // The ledger is checked once at start-up: a restart that left a task
     // half-way is exactly the case a reconciliation pass exists to describe.
+    if (this.reconciliation) {
+      this.ledgerEventCount = await this.reconciliation.ledgerLength();
+    }
+
     await this.runReconciliation("startup");
   }
 
@@ -153,6 +187,8 @@ export class ZhixingRelay {
     const snapshot = this.store.snapshot();
     const now = Date.now();
     const bridgeUp = this.bridge.hasClient();
+    const task = snapshot.currentTask;
+    const execution = task?.execution ?? null;
 
     return {
       ...snapshot,
@@ -178,6 +214,21 @@ export class ZhixingRelay {
         : null,
       lastTaskAt: this.lastTaskAt === null ? null : new Date(this.lastTaskAt).toISOString(),
       lastTaskAgeMs: this.lastTaskAt === null ? null : Math.max(0, now - this.lastTaskAt),
+      /** True while reconciliation is holding the scheduler. */
+      reconciliationHold: this.reconciliationHold,
+      /**
+       * Where THIS dispatch stands. Deliberately a separate axis from `state`:
+       * "the relay is busy" and "WorkBuddy confirmed the task started" are
+       * different facts, and only one of them survives a restart.
+       */
+      executionStage: execution?.stage ?? null,
+      executionStageStartedAt: execution?.stageStartedAt ?? null,
+      executionLastProgressAt: execution?.lastProgressAt ?? null,
+      executionHistory: execution?.history ?? [],
+      currentDispatchId: task?.dispatchId ?? null,
+      currentAttempt: typeof task?.attempt === "number" ? task.attempt : null,
+      /** Events in the ledger, or null when the relay has no ledger. */
+      ledgerEventCount: this.ledgerEventCount,
     };
   }
 
@@ -402,15 +453,44 @@ export class ZhixingRelay {
       task.workbuddyOutboundMessageId &&
       !this.workAbort
     ) {
-      void this.resumeWorkBuddyWait(
-        task.taskId,
-        task.workbuddyOutboundMessageId,
-        task.modelId,
+      /*
+       * Neither branch may be awaited. Resuming is the answer to a request
+       * that is already late: whoever asked (a human at a console, an HTTP
+       * caller under pm2) is waiting for the relay to run again, not for
+       * WorkBuddy to answer the task. The turn keeps going in the background
+       * and reports its stage through `status()` from then on.
+       */
+      this.scheduleWork(() =>
+        this.resumeWorkBuddyWait(
+          task.taskId,
+          task.workbuddyOutboundMessageId as string,
+          task.modelId,
+        ),
       );
       return;
     }
 
-    await this.flushOnePending();
+    this.scheduleWork(() => this.flushOnePending());
+  }
+
+  /**
+   * Starts a follow-up step without waiting for it.
+   *
+   * The rejection is caught and printed here rather than left to float, which
+   * is what keeps a background dispatch from turning into an unhandled
+   * rejection - the one way a fast-returning `resume` could still look like a
+   * crash.
+   */
+  private scheduleWork(step: () => Promise<void>): void {
+    void Promise.resolve()
+      .then(step)
+      .catch((error: unknown) => {
+        console.error(
+          `[relay] background step failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
   }
 
   async stopCurrentRound(reason = "manual"): Promise<void> {
@@ -510,15 +590,28 @@ export class ZhixingRelay {
 
         if (message.ok) {
           /*
-           * The extension confirms the RESULT reached ChatGPT's composer.
-           * Releasing here closes the round as soon as the delivery is real
-           * instead of waiting for the lease; the record is already gone when
-           * only the lease could confirm it.
+           * The extension confirms the RESULT reached ChatGPT's composer,
+           * which is the delivery acknowledgement. Releasing here closes the
+           * round as soon as the delivery is real instead of waiting for the
+           * lease; the record is already gone when only the lease could
+           * confirm it.
            */
-          const snapshot = this.store.snapshot();
-          if (snapshot.currentTask?.status === "sent_to_gpt") {
+          const task = this.store.snapshot().currentTask;
+          if (task?.status === "sent_to_gpt") {
+            await this.noteStage({
+              taskId: task.taskId,
+              taskFingerprint: task.taskFingerprint ?? "*",
+              dispatchId: task.dispatchId ?? null,
+              attempt: task.attempt ?? null,
+              stage: "RESULT_ACKED",
+              ledgerEvent: "RESULT_ACKED",
+              workbuddyMessageId: task.workbuddyOutboundMessageId ?? null,
+              resultId: message.requestId ?? null,
+              detail: { sent: message.sent ?? false, staged: message.staged ?? false },
+            });
+
             const released = await this.completeCurrentRound(
-              snapshot.currentTask.taskId,
+              task.taskId,
               "gpt_send_confirmed",
             );
 
@@ -890,6 +983,37 @@ export class ZhixingRelay {
           taskId,
           error: detail,
         });
+      } else if (error instanceof UnconfirmedDispatchError) {
+        /*
+         * The task record stays exactly as it is, carrying
+         * RECONCILIATION_REQUIRED. A click may already have gone out, so the
+         * honest next step is a reconciliation and a human decision - not a
+         * requeue that could send the task a second time. The record being
+         * left in place is also what keeps the persisted stage alive across a
+         * restart, so the evidence is not lost with the process.
+         */
+        await this.audit.write("dispatch_unconfirmed", {
+          taskId,
+          dispatchId: plan.dispatchId,
+          error: detail,
+        });
+
+        console.error(
+          `[relay] task ${taskId} left in reconciliation, NOT requeued: ${detail}`,
+        );
+
+        /*
+         * The record carries RECONCILIATION_REQUIRED, so the chain is read at
+         * once: if it cannot be explained, scheduling freezes here instead of
+         * queuing the next task behind an answer nobody knows was sent.
+         */
+        await this.runReconciliation(`unconfirmed dispatch of ${taskId}`);
+        if (this.reconciliationHold) {
+          await this.audit.write("reconciliation_blocked", {
+            reason: `unconfirmed dispatch of ${taskId}`,
+            taskId,
+          });
+        }
       } else {
         await this.audit.write("workbuddy_turn_failed", {
           taskId,
@@ -909,10 +1033,12 @@ export class ZhixingRelay {
         });
       }
 
-      await this.store.mutate((state) => {
-        state.currentTask = null;
-        state.state = state.paused ? "PAUSED" : "IDLE";
-      });
+      if (!(error instanceof UnconfirmedDispatchError)) {
+        await this.store.mutate((state) => {
+          state.currentTask = null;
+          state.state = state.paused ? "PAUSED" : "IDLE";
+        });
+      }
     } finally {
       /*
        * Whatever happened - send failure, CDP drop, a real cancellation or a
@@ -1014,6 +1140,10 @@ export class ZhixingRelay {
       }
 
       // Normal send: apply the routed model BEFORE the text can be typed.
+      const sendId = args.dispatchId ?? dispatchIdFor(taskId, 0);
+      const sendAttempt = args.attempt ?? 0;
+      const sendFingerprint = args.taskFingerprint ?? "";
+
       await this.store.mutate((state) => {
         state.state = "WAIT_WORKBUDDY";
         state.currentTask = {
@@ -1022,12 +1152,18 @@ export class ZhixingRelay {
           sourceText: text,
           startedAt: state.currentTask?.startedAt ?? isoNow(),
           status: "sending",
+          taskFingerprint: sendFingerprint,
+          dispatchId: sendId,
+          attempt: sendAttempt,
+          execution: createExecutionState({ stage: "DISPATCHING", at: isoNow() }),
           ...(current ? { modelId: current.id, modelLabel: current.label } : {}),
         };
       });
 
       await this.audit.write("workbuddy_send_start", {
         taskId,
+        dispatchId: sendId,
+        attempt: sendAttempt,
         textLength: text.length,
         ...(current ? { modelId: current.id, modelLabel: current.label } : {}),
       });
@@ -1037,20 +1173,66 @@ export class ZhixingRelay {
         await this.applyRoutedModel(taskId, current);
       }
 
-      const outboundId = await this.workbuddy.sendText(text);
+      const ack = await this.workbuddy.sendText(text, {
+        taskId,
+        pollIntervalMs: this.config.workbuddy.pollIntervalMs,
+        sendConfirmTimeoutMs: this.config.relay.sendConfirmTimeoutMs,
+      });
 
       /*
-       * The moment this resolves the task is on its way into WorkBuddy, and a
-       * retry is no longer provably safe. That is exactly why the evidence is
-       * written here rather than after the wait.
+       * INPUT first, and only then anything else. The composer has to be read
+       * back and matched before a click can happen, so a mismatch here is the
+       * one send failure the task can walk away from - nothing was clicked.
        */
-      await this.recordEvidence({
-        event: "SEND_CONFIRMED",
+      await this.noteStage({
         taskId,
-        taskFingerprint: args.taskFingerprint ?? "",
-        dispatchId: args.dispatchId ?? "",
-        attempt: args.attempt ?? 0,
+        taskFingerprint: sendFingerprint,
+        dispatchId: sendId,
+        attempt: sendAttempt,
+        stage: ack.input.ok ? "INPUT_CONFIRMED" : "BLOCKED",
+        ledgerEvent: ack.input.ok ? "INPUT_CONFIRMED" : "INPUT_CONFIRM_FAILED",
+        detail: { ...ack.input, composer: ack.input.reason, clickAttempted: ack.clickOk },
+      });
+
+      if (!ack.input.ok) {
+        throw new InputNotConfirmedError(
+          `WorkBuddy composer did not hold the payload for ${taskId} (${ack.input.reason}); nothing was clicked`,
+        );
+      }
+
+      /*
+       * A successful click is the weakest fact there is. Without a new turn
+       * carrying this task the world after the click is genuinely unknown, and
+       * unknown is a reconciliation case - never an implicit success and never
+       * a reason to send again.
+       */
+      if (!ack.send.ok) {
+        await this.noteStage({
+          taskId,
+          taskFingerprint: sendFingerprint,
+          dispatchId: sendId,
+          attempt: sendAttempt,
+          stage: "RECONCILIATION_REQUIRED",
+          ledgerEvent: "SEND_CONFIRM_FAILED",
+          workbuddyMessageId: ack.send.observedMessageId,
+          detail: { ...ack.send },
+        });
+        throw new UnconfirmedDispatchError(
+          `the send of ${taskId} could not be confirmed (${ack.send.reason}); reconciliation required`,
+        );
+      }
+
+      const outboundId = ack.send.observedMessageId ?? ack.outboundId;
+
+      await this.noteStage({
+        taskId,
+        taskFingerprint: sendFingerprint,
+        dispatchId: sendId,
+        attempt: sendAttempt,
+        stage: "SEND_CONFIRMED",
+        ledgerEvent: "SEND_CONFIRMED",
         workbuddyMessageId: outboundId,
+        detail: { ...ack.send, clickOk: ack.clickOk },
       });
 
       await this.store.mutate((state) => {
@@ -1062,6 +1244,8 @@ export class ZhixingRelay {
 
       await this.audit.write("workbuddy_message_sent", {
         taskId,
+        dispatchId: sendId,
+        attempt: sendAttempt,
         workbuddyMessageId: outboundId,
       });
 
@@ -1069,27 +1253,135 @@ export class ZhixingRelay {
 
       this.workAbort = new AbortController();
 
-      const result = await this.workbuddy.waitForAssistantReply(outboundId, {
+      /*
+       * RUNNING is a separate confirmation for a separate question. WorkBuddy
+       * showing the message is not the same fact as WorkBuddy working on it,
+       * and only one of those two ever deserves the name "confirmed started".
+       */
+      const running = await this.workbuddy.waitForRunning({
+        pollIntervalMs: this.config.workbuddy.pollIntervalMs,
+        timeoutMs: this.config.relay.runningConfirmTimeoutMs,
         signal: args.signal ?? this.workAbort.signal,
-        ...(args.onProgress ? { onProgress: args.onProgress } : {}),
       });
+
+      if (running.outcome === "cancelled") {
+        await this.noteStage({
+          taskId,
+          taskFingerprint: sendFingerprint,
+          dispatchId: sendId,
+          attempt: sendAttempt,
+          stage: "RECONCILIATION_REQUIRED",
+          ledgerEvent: "DISPATCH_STALLED",
+          workbuddyMessageId: outboundId,
+          detail: { outcome: "cancelled", reason: running.reason, evidence: running.evidence },
+        });
+        throw new UnconfirmedDispatchError(
+          `WorkBuddy cancelled task ${taskId} after the send was confirmed`,
+        );
+      }
+
+      if (running.outcome === "timeout") {
+        await this.noteStage({
+          taskId,
+          taskFingerprint: sendFingerprint,
+          dispatchId: sendId,
+          attempt: sendAttempt,
+          stage: "RECONCILIATION_REQUIRED",
+          ledgerEvent: "RUNNING_CONFIRM_TIMEOUT",
+          workbuddyMessageId: outboundId,
+          detail: { outcome: "timeout", reason: running.reason, evidence: running.evidence },
+        });
+        throw new UnconfirmedDispatchError(
+          `WorkBuddy neither ran nor answered ${taskId} inside the confirmation window`,
+        );
+      }
+
+      /*
+       * "running" and "result_ready" are both the task really executing: one
+       * was watched working, the other finished inside the window. A finished
+       * answer must never be dropped for want of a running confirmation.
+       */
+      await this.noteStage(
+        running.outcome === "running"
+          ? {
+              taskId,
+              taskFingerprint: sendFingerprint,
+              dispatchId: sendId,
+              attempt: sendAttempt,
+              stage: "RUNNING_CONFIRMED",
+              ledgerEvent: "RUNNING_CONFIRMED",
+              workbuddyMessageId: outboundId,
+              detail: { reason: running.reason, evidence: running.evidence },
+            }
+          : {
+              taskId,
+              taskFingerprint: sendFingerprint,
+              dispatchId: sendId,
+              attempt: sendAttempt,
+              stage: "RESULT_RECEIVED",
+              ledgerEvent: "RESULT_RECEIVED",
+              workbuddyMessageId: outboundId,
+              detail: { outcome: "result_ready", reason: running.reason, evidence: running.evidence },
+            },
+      );
+
+      let answer: { text: string; lastMessageId: string } | null = null;
+
+      try {
+        const waited = await this.workbuddy.waitForAssistantReply(outboundId, {
+          signal: args.signal ?? this.workAbort.signal,
+          ...(args.onProgress ? { onProgress: args.onProgress } : {}),
+        });
+        answer = { text: waited.text, lastMessageId: waited.lastMessageId };
+      } catch (error) {
+        this.workAbort = null;
+
+        /*
+         * A cancellation that surfaces here still happened after the task was
+         * sent, so it is a reconciliation case - never a failure that earns a
+         * retry.
+         */
+        if (classifyTurnFailure(error) === "cancelled") {
+          await this.noteStage({
+            taskId,
+            taskFingerprint: sendFingerprint,
+            dispatchId: sendId,
+            attempt: sendAttempt,
+            stage: "RECONCILIATION_REQUIRED",
+            ledgerEvent: "DISPATCH_STALLED",
+            workbuddyMessageId: outboundId,
+            detail: {
+              outcome: "cancelled",
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          });
+          throw new UnconfirmedDispatchError(
+            `WorkBuddy cancelled task ${taskId} while its answer was being waited for`,
+          );
+        }
+
+        throw error;
+      }
 
       this.workAbort = null;
 
       /*
-       * Output means the turn really ran. Whether or not it finishes is not
-       * known yet, and that is the one thing that must never be guessed at.
+       * Output means the turn ran. Whether or not it finishes is not known
+       * yet, and that is the one thing that must never be guessed at.
        */
-      await this.recordEvidence({
-        event: "RUNNING_CONFIRMED",
+      await this.noteStage({
         taskId,
-        taskFingerprint: args.taskFingerprint ?? "",
-        dispatchId: args.dispatchId ?? "",
-        attempt: args.attempt ?? 0,
+        taskFingerprint: sendFingerprint,
+        dispatchId: sendId,
+        attempt: sendAttempt,
+        stage: "RESULT_RECEIVED",
+        ledgerEvent: "RESULT_RECEIVED",
         workbuddyMessageId: outboundId,
+        resultId: outboundId,
+        detail: { bodyLength: answer?.text.length ?? 0, observedBy: "wait" },
       });
 
-      if (!result.text) {
+      if (!answer || !answer.text) {
         throw new Error("WorkBuddy returned an empty assistant response");
       }
 
@@ -1127,7 +1419,7 @@ export class ZhixingRelay {
         continue;
       }
 
-      return { lastMessageId: result.lastMessageId, body: result.text };
+      return { lastMessageId: answer?.lastMessageId ?? outboundId, body: answer?.text ?? "" };
     }
 
     // Only reachable when the fallback chain ran out; nothing was sent.
@@ -1523,6 +1815,48 @@ export class ZhixingRelay {
     workbuddyMessageId: string,
     body: string,
   ): Promise<void> {
+    const current = this.store.snapshot().currentTask;
+    const taskFingerprint = current?.taskFingerprint ?? "*";
+    const dispatchId = current?.dispatchId ?? null;
+    const attempt = current?.attempt ?? null;
+
+    /*
+     * The answer has to belong to the dispatch the relay is actually running,
+     * and it has to name the task the relay expects. A RESULT carrying another
+     * TASK_ID is evidence from another round, and the honest answer to that is
+     * to stop rather than to deliver a foreign answer to ChatGPT.
+     */
+    const received = parseRelayEnvelope(body);
+    const receivedTaskId = received?.taskId ?? null;
+
+    if (receivedTaskId !== null && receivedTaskId !== taskId) {
+      await this.noteStage({
+        taskId,
+        taskFingerprint,
+        dispatchId,
+        attempt,
+        stage: "RECONCILIATION_REQUIRED",
+        ledgerEvent: "DISPATCH_STALLED",
+        workbuddyMessageId,
+        detail: {
+          outcome: "result_task_id_mismatch",
+          resultTaskId: receivedTaskId,
+          expectedTaskId: taskId,
+        },
+      });
+
+      await this.audit.write("workbuddy_result_task_mismatch", {
+        taskId,
+        resultTaskId: receivedTaskId,
+      });
+
+      console.error(
+        `[relay] WorkBuddy answered task ${receivedTaskId} while ${taskId} was in flight; ` +
+          `the answer is not delivered and the round is in reconciliation`,
+      );
+      return;
+    }
+
     const wrapped = wrapWorkBuddyResult({
       taskId,
       workbuddyMessageId,
@@ -1535,14 +1869,18 @@ export class ZhixingRelay {
       length: wrapped.length,
     });
 
-    const current = this.store.snapshot().currentTask;
-    await this.recordEvidence({
-      event: "RESULT_RECEIVED",
+    // The receipt is bound to the dispatch that produced it, never to "the
+    // last assistant message on the page".
+    await this.noteStage({
       taskId,
-      taskFingerprint: current?.taskFingerprint ?? "*",
-      dispatchId: current?.dispatchId ?? null,
-      attempt: current?.attempt ?? null,
+      taskFingerprint,
+      dispatchId,
+      attempt,
+      stage: "RESULT_RECEIVED",
+      ledgerEvent: "RESULT_RECEIVED",
       workbuddyMessageId,
+      resultId: workbuddyMessageId,
+      detail: { length: wrapped.length },
     });
 
     /*
@@ -1552,14 +1890,42 @@ export class ZhixingRelay {
      */
     this.armResultLease(taskId);
 
+    /*
+     * Persist before delivering. The queued RESULT is the only thing that
+     * survives a crash between "WorkBuddy answered" and "ChatGPT saw it", and
+     * that is exactly the window in which the alternative - asking WorkBuddy
+     * to run the task again - would burn a whole turn of a real assistant.
+     */
+    const pending = await this.persistWorkBuddyResult(
+      taskId,
+      workbuddyMessageId,
+      wrapped,
+    );
+
+    await this.noteStage({
+      taskId,
+      taskFingerprint,
+      dispatchId,
+      attempt,
+      stage: "RESULT_PERSISTED",
+      ledgerEvent: "RESULT_PERSISTED",
+      workbuddyMessageId,
+      resultId: workbuddyMessageId,
+      detail: { pendingId: pending.id },
+    });
+
     const snapshot = this.store.snapshot();
 
     if (snapshot.paused || !this.bridge.hasClient()) {
-      await this.queueWorkBuddyResult(
+      await this.audit.write("workbuddy_result_queued", {
         taskId,
         workbuddyMessageId,
-        wrapped,
-        snapshot.paused ? "relay is paused" : "Chrome bridge is disconnected",
+        reason: snapshot.paused ? "relay is paused" : "Chrome bridge is disconnected",
+      });
+      console.log(
+        `[relay] WorkBuddy result queued: ${
+          snapshot.paused ? "relay is paused" : "Chrome bridge is disconnected"
+        }`,
       );
       return;
     }
@@ -1569,15 +1935,53 @@ export class ZhixingRelay {
         taskId,
         workbuddyMessageId,
         wrapped,
+        pending.id,
       );
     } catch (error) {
-      await this.queueWorkBuddyResult(
+      /*
+       * The persisted RESULT stays in the queue. The next flush re-delivers
+       * it to ChatGPT and never runs the WorkBuddy task again.
+       */
+      await this.audit.write("workbuddy_result_delivery_failed", {
         taskId,
         workbuddyMessageId,
-        wrapped,
-        error instanceof Error ? error.message : String(error),
-      );
+        error: error instanceof Error ? error.message : String(error),
+      });
+      console.error(`[relay] WorkBuddy result delivery failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  /**
+   * Writes the RESULT to the durable queue.
+   *
+   * This is the "persisted" half of the result pipeline and the only one. The
+   * live state cannot hold an answer: it is overwritten by the next round, so
+   * a result that only ever lived there would be gone the moment the relay
+   * was restarted.
+   */
+  private async persistWorkBuddyResult(
+    taskId: string,
+    workbuddyMessageId: string,
+    text: string,
+  ): Promise<PendingItem> {
+    const item: PendingItem = {
+      kind: "workbuddy_result",
+      id: makeId("pending-wb"),
+      taskId,
+      text,
+      workbuddyMessageId,
+      createdAt: isoNow(),
+    };
+
+    await this.store.enqueue(item);
+
+    await this.store.mutate((state) => {
+      if (state.currentTask?.taskId !== taskId) return;
+      state.currentTask.status = "result_pending";
+      state.currentTask.sentToGptAt = isoNow();
+    });
+
+    return item;
   }
 
   /**
@@ -1616,12 +2020,20 @@ export class ZhixingRelay {
       reason,
     });
 
-    await this.recordEvidence({
-      event: "TASK_COMPLETED",
+    /*
+     * COMPLETED is the last stage, and reaching it is what makes the whole
+     * chain readable: RESULT_RECEIVED, RESULT_PERSISTED, RESULT_DELIVERED and
+     * RESULT_ACKED were all accepted before, in that order.
+     */
+    await this.noteStage({
       taskId,
       taskFingerprint: task?.taskFingerprint ?? "*",
       dispatchId: task?.dispatchId ?? null,
       attempt: task?.attempt ?? null,
+      // The record is already cleared, so the stage to move from is handed in.
+      execution: task?.execution ?? null,
+      stage: "COMPLETED",
+      ledgerEvent: "TASK_COMPLETED",
       workbuddyMessageId: task?.workbuddyOutboundMessageId ?? null,
       detail: { reason },
     });
@@ -1828,6 +2240,84 @@ export class ZhixingRelay {
   }
 
   /**
+   * One step of the execution stage machine, with its ledger evidence.
+   *
+   * This is the only place a stage is written, so the three rules that matter
+   * cannot drift apart:
+   *
+   *   stale         an acknowledgement from a dispatch the relay is no longer
+   *                 running is dropped, never applied to the live task
+   *   monotonic      a stage only moves forward, so a late copy of an older
+   *                 acknowledgement cannot rewind a round
+   *   observable     every accepted move writes its ledger event
+   *
+   * The stage is persisted with the task, which is what lets a restarted relay
+   * tell "the result was persisted" from "the task has to run again".
+   */
+  private async noteStage(args: {
+    taskId: string;
+    taskFingerprint: string;
+    dispatchId?: string | null;
+    attempt?: number | null;
+    /** Overrides the persisted stage, for a task whose record was just cleared. */
+    execution?: TaskExecutionState | null;
+    stage: TaskExecutionStage;
+    /** The ledger event that the move above is worth recording. */
+    ledgerEvent: Parameters<ReconciliationService["recordExecutionEvidence"]>[0]["event"];
+    workbuddyMessageId?: string | null;
+    resultId?: string | null;
+    detail?: Record<string, unknown> | null;
+  }): Promise<TaskExecutionState | null> {
+    const now = isoNow();
+    const live = this.store.snapshot().currentTask;
+    const current = args.execution === undefined ? live?.execution ?? null : args.execution;
+
+    if (isStaleDispatch(live, { taskId: args.taskId, dispatchId: args.dispatchId ?? undefined })) {
+      console.warn(
+        `[relay] ignoring ${args.stage} for ${args.taskId}: the running dispatch is ` +
+          `${live?.dispatchId ?? "none"}, so this is an echo from an older round`,
+      );
+      return current;
+    }
+
+    const advanced = advanceStage(current, args.stage, now);
+
+    if (!advanced) return current;
+
+    await this.store.mutate((state) => {
+      if (state.currentTask?.taskId !== args.taskId) return;
+      state.currentTask.execution = advanced;
+    });
+
+    /*
+     * Already there: the move is a no-op, so writing it again would only add a
+     * second line for a fact the ledger already holds. An alert stage may be
+     * re-entered, because freezing an older alert is still new information.
+     */
+    if (current && current.stage === args.stage && !isAlertStage(args.stage)) {
+      return advanced;
+    }
+
+    await this.recordEvidence({
+      event: args.ledgerEvent,
+      taskId: args.taskId,
+      taskFingerprint: args.taskFingerprint,
+      dispatchId: args.dispatchId ?? null,
+      attempt: args.attempt ?? null,
+      workbuddyMessageId: args.workbuddyMessageId ?? null,
+      resultId: args.resultId ?? null,
+      detail: args.detail ?? null,
+    });
+
+    return advanced;
+  }
+
+  /** Keeps the `status` ledger counter cheap without reading the file. */
+  private noteLedgerWrite(count = 1): void {
+    this.ledgerEventCount = (this.ledgerEventCount ?? 0) + count;
+  }
+
+  /**
    * Writes one execution-evidence event.
    *
    * The write is best-effort by design: the relay must not disappear because
@@ -1848,12 +2338,108 @@ export class ZhixingRelay {
 
     try {
       await this.reconciliation.recordExecutionEvidence(input);
+      this.noteLedgerWrite();
     } catch (error) {
       console.error(
         `[relay] could not record ${input.event} for ${input.taskId}: ` +
           `${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  /**
+   * Lifts a reconciliation hold by recording the decision first.
+   *
+   * A hold is frozen evidence, so the way out of it is a NEW event saying why
+   * the chain is now explainable. Nothing here ever edits, truncates or
+   * replaces a line: the ledger keeps every fact it was given, which is what
+   * makes the freeze auditable instead of merely annoying.
+   */
+  async resolveReconciliation(reason: string): Promise<{ ok: boolean; message: string }> {
+    if (!this.reconciliation) {
+      return {
+        ok: false,
+        message: "the relay has no ledger, so nothing is holding scheduling",
+      };
+    }
+
+    if (!this.reconciliationHold) {
+      return { ok: false, message: "reconciliation is not holding; nothing to resolve" };
+    }
+
+    await this.reconciliation.recordReconciliationResolved({ reason, source: "control" });
+    this.noteLedgerWrite();
+
+    /*
+     * The record is written before the runtime is touched, never after: a task
+     * that reconciliation froze is put back on the queue here, so the next send
+     * goes through the very same decision the queue makes for every other task
+     * instead of through a second, special retry rule.
+     */
+    await this.requeueFrozenTask(reason);
+
+    // Re-read the ledger: the hold may have been a symptom, not the disease.
+    await this.runReconciliation(`resolved: ${reason}`);
+
+    if (this.reconciliationHold) {
+      return {
+        ok: true,
+        message:
+          "resolution recorded, but the chain is still unexplained and scheduling stays frozen",
+      };
+    }
+
+    this.scheduleWork(() => this.flushOnePending());
+
+    return {
+      ok: true,
+      message: "resolution recorded; scheduling is released and the queue will flush",
+    };
+  }
+
+  /**
+   * Puts a task that reconciliation froze back on the queue.
+   *
+   * It is the human, not the relay, that may decide a cancellation was a
+   * mistake - so the relay must not do this on its own, which is exactly why
+   * the frozen record is left in place and only this call moves it. The record
+   * itself is not deleted: the ledger already holds every stage it passed, so
+   * the task stays readable after the live record is gone.
+   */
+  private async requeueFrozenTask(reason: string): Promise<void> {
+    const task = this.store.snapshot().currentTask;
+
+    if (!task || !isAlertStage(task.execution?.stage ?? "DISPATCHING")) return;
+
+    await this.store.enqueue({
+      kind: "gpt_task",
+      id: makeId("pending-task"),
+      text: task.sourceText ?? task.taskId,
+      fingerprint: task.sourceFingerprint ?? task.taskFingerprint ?? task.taskId,
+      createdAt: isoNow(),
+      taskId: task.taskId,
+      attempt: task.attempt ?? 0,
+      retryCount: (task.attempt ?? 0) + 1,
+      reason: `reconciled: ${reason}`,
+    });
+
+    await this.store.mutate((state) => {
+      if (state.currentTask?.taskId !== task.taskId) return;
+      state.currentTask = null;
+      if (state.state !== "PAUSED") state.state = "IDLE";
+    });
+
+    await this.audit.write("task_requeued", {
+      taskId: task.taskId,
+      reason: `reconciled: ${reason}`,
+      attempt: task.attempt ?? 0,
+      source: "reconciliation",
+    });
+
+    console.log(
+      `[relay] task ${task.taskId} was put back on the queue after reconciling it ` +
+        `("${reason}"); nothing was sent until the queue re-decides`,
+    );
   }
 
   /**
@@ -1869,6 +2455,7 @@ export class ZhixingRelay {
     try {
       const { report } = await this.reconciliation.reconcile(reason);
       await this.reconciliation.recordReconciliationOutcome(report);
+      this.noteLedgerWrite();
 
       if (report.blocked) {
         this.reconciliationHold = true;
@@ -1953,43 +2540,14 @@ export class ZhixingRelay {
     return typeof configured === "number" && configured >= 0 ? configured : 3;
   }
 
-  private async queueWorkBuddyResult(
-    taskId: string,
-    workbuddyMessageId: string,
-    text: string,
-    reason: string,
-  ): Promise<void> {
-    await this.store.mutate((state) => {
-      if (state.currentTask?.taskId === taskId) {
-        state.currentTask.status = "result_pending";
-        state.currentTask.sentToGptAt = isoNow();
-      }
-    });
-
-    await this.store.enqueue({
-      kind: "workbuddy_result",
-      id: makeId("pending-wb"),
-      taskId,
-      text,
-      workbuddyMessageId,
-      createdAt: isoNow(),
-    });
-
-    await this.audit.write("workbuddy_result_queued", {
-      taskId,
-      workbuddyMessageId,
-      reason,
-    });
-
-    console.log(`[relay] WorkBuddy result queued: ${reason}`);
-  }
-
   private async sendWorkBuddyResultToGPT(
     taskId: string,
     workbuddyMessageId: string,
     text: string,
+    pendingId?: string | null,
   ): Promise<void> {
     const requestId = makeId("wb-result");
+    const task = this.store.snapshot().currentTask;
 
     await this.expectInjectedText(text);
 
@@ -2001,11 +2559,41 @@ export class ZhixingRelay {
     });
 
     /*
-     * Deliberately no store mutation here. Only the completion owns the
-     * task record: touching the state from the send would let a RESULT that
-     * arrived late - or a queued one belonging to an earlier task - park the
-     * relay in WAIT_GPT again.
+     * DELIVERY and ACKNOWLEDGEMENT are two different facts and only one of
+     * them closes the round. The bridge sent the answer; whether ChatGPT took
+     * it is the extension's `chatgpt_send_result` to say, and that is the
+     * RESULT_ACKED below. Until then the task record stays under the result
+     * lease, so a relay that dies in between re-delivers the answer instead
+     * of losing it.
      */
+    await this.noteStage({
+      taskId,
+      taskFingerprint: task?.taskFingerprint ?? "*",
+      dispatchId: task?.dispatchId ?? null,
+      attempt: task?.attempt ?? null,
+      stage: "RESULT_DELIVERED",
+      ledgerEvent: "RESULT_DELIVERED",
+      workbuddyMessageId,
+      resultId: requestId,
+      detail: { requestId, via: "bridge", autoSend: this.config.relay.autoSendToChatGPT },
+    });
+
+    await this.store.mutate((state) => {
+      if (state.currentTask?.taskId !== taskId) return;
+      state.currentTask.status = "sent_to_gpt";
+      state.currentTask.sentToGptAt = isoNow();
+      state.state = "WAIT_GPT";
+    });
+
+    /*
+     * The durable copy has done its job. It is dropped only now, so a crash
+     * before this point leaves a queued RESULT that the next flush re-sends -
+     * the one thing that must never happen is a queued answer being sent
+     * twice.
+     */
+    if (pendingId) {
+      await this.store.removePending(pendingId);
+    }
 
     await this.audit.write("workbuddy_result_sent_to_gpt", {
       taskId,
@@ -2015,17 +2603,6 @@ export class ZhixingRelay {
     });
 
     console.log(`[relay] WorkBuddy -> GPT task=${taskId}`);
-
-    /*
-     * The answer is with ChatGPT now. Keeping the task record would park the
-     * relay in WAIT_GPT until the next task happened to arrive, so the round
-     * is closed here and the queue gets a chance to move on.
-     */
-    const released = await this.completeCurrentRound(taskId, "result_delivered");
-
-    if (released) {
-      await this.flushOnePending();
-    }
   }
 
   private async expectInjectedText(text: string): Promise<void> {
@@ -2073,10 +2650,13 @@ export class ZhixingRelay {
       }
 
       try {
+        // The queue entry is the durable copy of a result that WorkBuddy
+        // already ran, so a failed delivery re-sends the answer, never the task.
         await this.sendWorkBuddyResultToGPT(
           item.taskId,
           item.workbuddyMessageId,
           item.text,
+          item.id,
         );
       } catch {
         await this.store.enqueue(item);

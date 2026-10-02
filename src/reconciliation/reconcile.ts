@@ -82,7 +82,9 @@ const PIPELINE: readonly ReconciliationEventName[] = [
   "SEND_CONFIRMED",
   "RUNNING_CONFIRMED",
   "RESULT_RECEIVED",
+  "RESULT_PERSISTED",
   "RESULT_DELIVERED",
+  "RESULT_ACKED",
   "TASK_COMPLETED",
 ];
 
@@ -311,7 +313,8 @@ export function reconcileTask(
     !blocking &&
     has("TASK_REQUEUED") &&
     !has("RUNNING_CONFIRMED") &&
-    !has("RESULT_RECEIVED");
+    !has("RESULT_RECEIVED") &&
+    !has("RESULT_ACKED");
 
   if (findings.length === 0) {
     findings.push({

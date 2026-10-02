@@ -56,6 +56,19 @@ export function loadConfig() {
        */
       maxTaskRetries: envInt("RELAY_MAX_TASK_RETRIES", 3),
       /**
+       * How long the relay waits for WorkBuddy to grow a new turn after the
+       * send was clicked. Timing out is NOT proof that nothing was sent: the
+       * window only decides how long the relay records the uncertainty.
+       */
+      sendConfirmTimeoutMs: envInt("WORKBUDDY_SEND_CONFIRM_MS", 30_000),
+      /**
+       * How long the relay watches for WorkBuddy to actually start working
+       * after the send was confirmed. A task that shows neither processing nor
+       * a result inside this window is stalled, and a stalled dispatch is a
+       * reconciliation case - never a reason to send again.
+       */
+      runningConfirmTimeoutMs: envInt("WORKBUDDY_RUNNING_CONFIRM_MS", 120_000),
+      /**
        * The heartbeat that makes a wedged terminal visible: a relay whose
        * log stops here has stopped really running, even if the console
        * window still looks alive.

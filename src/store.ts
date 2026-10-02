@@ -101,6 +101,20 @@ export class RelayStore {
     });
   }
 
+  /**
+   * Drops one queued item, by id.
+   *
+   * The only caller is a RESULT that ChatGPT acknowledged: the durable copy of
+   * the answer has done its job and re-delivering it would send the same text
+   * to the thread twice. A queue entry is written before the delivery and
+   * removed after the acknowledgement, never before.
+   */
+  async removePending(id: string): Promise<void> {
+    await this.mutate((state) => {
+      state.pending = state.pending.filter((item) => item.id !== id);
+    });
+  }
+
   async shiftPending(): Promise<PendingItem | null> {
     let item: PendingItem | null = null;
 

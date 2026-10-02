@@ -1,3 +1,5 @@
+import type { TaskExecutionState } from "./delivery/stage.js";
+
 export type RelayStateName =
   | "IDLE"
   | "WAIT_WORKBUDDY"
@@ -58,6 +60,15 @@ export type CurrentTask = {
    */
   modelId?: string;
   modelLabel?: string;
+  /**
+   * How far THIS dispatch has been acknowledged to have reached.
+   *
+   * Separate from the global state on purpose: "the relay is busy" and "the
+   * task was confirmed sent" are different facts, and only one of them can be
+   * recovered from after a restart. Persisted with the task so a relay that
+   * comes back knows whether to re-deliver a result or re-run a task.
+   */
+  execution?: TaskExecutionState | undefined;
 };
 
 export type PersistedState = {

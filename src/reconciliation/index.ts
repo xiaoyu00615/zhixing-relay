@@ -154,7 +154,13 @@ export class ReconciliationService {
       | "SEND_CONFIRMED"
       | "RUNNING_CONFIRMED"
       | "RESULT_RECEIVED"
+      | "RESULT_PERSISTED"
       | "RESULT_DELIVERED"
+      | "RESULT_ACKED"
+      | "INPUT_CONFIRM_FAILED"
+      | "SEND_CONFIRM_FAILED"
+      | "RUNNING_CONFIRM_TIMEOUT"
+      | "DISPATCH_STALLED"
       | "TASK_COMPLETED"
       | "TASK_REQUEUED"
       | "TASK_BLOCKED"
@@ -178,6 +184,34 @@ export class ReconciliationService {
       source: input.source ?? "relay",
       detail: input.detail ?? null,
     });
+  }
+
+  /**
+   * The end of a hold, recorded rather than edited.
+   *
+   * A hold is lifted by a NEW event saying why the chain is now explainable,
+   * never by rewriting or deleting what the ledger already says. That is the
+   * only way an operator can lift a freeze without erasing the evidence of the
+   * mistake that froze it.
+   */
+  async recordReconciliationResolved(input: {
+    taskId?: string | null;
+    taskFingerprint?: string | null;
+    reason: string;
+    source?: ReconciliationSource;
+  }): Promise<ReconciliationEvent> {
+    return this.ledger.append({
+      event: "RECONCILIATION_RESOLVED",
+      taskId: input.taskId ?? "*",
+      taskFingerprint: input.taskFingerprint ?? "*",
+      source: input.source ?? "control",
+      detail: { reason: input.reason },
+    });
+  }
+
+  /** How many events the ledger holds. Cheap because it is only ever read. */
+  async ledgerLength(): Promise<number> {
+    return this.ledger.length();
   }
 
   async getTaskHistory(taskId: string): Promise<ReconciliationEvent[]> {

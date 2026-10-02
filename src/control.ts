@@ -31,6 +31,13 @@ export type RuntimeControl = {
   resume: () => Promise<void>;
   requestRestart: (reason: string) => Promise<{ ok: boolean; message: string }>;
   emitHeartbeat: () => string;
+  /**
+   * Records why a reconciliation hold is being lifted and releases it.
+   *
+   * Route handlers never decide anything: this calls the same method a
+   * reconciliation could be resolved with from the console.
+   */
+  resolveReconciliation?: (reason: string) => Promise<{ ok: boolean; message: string }>;
 };
 
 export const CONTROL_HOST = "127.0.0.1";
@@ -100,6 +107,25 @@ function statusPayload(raw: Record<string, unknown>) {
       ageMs: typeof raw.lastHeartbeatAgeMs === "number" ? raw.lastHeartbeatAgeMs : null,
       stale: raw.heartbeatStale === true,
     },
+    /**
+     * True while a reconciliation holds the scheduler: nothing is dispatched
+     * and nothing is queued until it is resolved by hand.
+     */
+    reconciliationHold: raw.reconciliationHold === true,
+    /**
+     * Where the current dispatch stands. Reported next to the global `state`
+     * because the two answer different questions - the relay being busy is not
+     * the same fact as WorkBuddy confirming the task was taken.
+     */
+    executionStage: typeof raw.executionStage === "string" ? raw.executionStage : null,
+    executionStageStartedAt:
+      typeof raw.executionStageStartedAt === "string" ? raw.executionStageStartedAt : null,
+    executionLastProgressAt:
+      typeof raw.executionLastProgressAt === "string" ? raw.executionLastProgressAt : null,
+    currentDispatchId: typeof raw.currentDispatchId === "string" ? raw.currentDispatchId : null,
+    currentAttempt: typeof raw.currentAttempt === "number" ? raw.currentAttempt : null,
+    ledgerEventCount:
+      typeof raw.ledgerEventCount === "number" ? raw.ledgerEventCount : null,
   };
 }
 
@@ -148,6 +174,23 @@ function routeFor(
       return async (_req, res) => {
         await control.pause("control_channel");
         sendJson(res, 200, { ok: true, ...statusPayload(control.status()) });
+      };
+
+    case "/control/reconciliation/resolve":
+      return async (_req, res) => {
+        const url = new URL(_req.url ?? "/", `http://${CONTROL_HOST}`);
+        const reason = url.searchParams.get("reason") ?? "control channel";
+
+        if (typeof control.resolveReconciliation !== "function") {
+          sendJson(res, 501, {
+            ok: false,
+            error: "reconciliation is not available on this relay",
+          });
+          return;
+        }
+
+        const result = await control.resolveReconciliation(reason);
+        sendJson(res, result.ok ? 200 : 409, result);
       };
 
     case "/control/restart":
