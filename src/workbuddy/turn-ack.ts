@@ -18,10 +18,26 @@
  * different facts.
  */
 
+/**
+ * Who authored a rendered node.
+ *
+ * `assistant` is WorkBuddy's own answer, its processing card, its status
+ * chrome and anything else on the assistant side. `unknown` is a container
+ * the page has not identified either way.
+ *
+ * Only `user` can prove that the relay's own text went out: the assistant
+ * side is always on screen and always moving, and treating it as a new
+ * outbound turn is what made the production relay answer
+ * `new_turn_wrong_task` for a send that had in fact succeeded.
+ */
+export type TurnRole = "user" | "assistant" | "unknown";
+
 /** One rendered turn/message container on the page. */
 export type ObservedTurn = {
   /** Stable enough to tell "the same turn" from "a new one" between polls. */
   signature: string;
+  /** Who wrote it. A send is only ever proven by a `user` turn. */
+  role: TurnRole;
   /** Whether this turn carries the task's identifier in its text. */
   containsTaskId: boolean;
 };
@@ -30,6 +46,13 @@ export type ObservedTurn = {
 export type TurnSnapshot = {
   /** What the composer still holds. Empty means it was cleared by a send. */
   inputText: string;
+  /**
+   * The outbound turns, and only those.
+   *
+   * Everything that is not a user-authored turn is filtered out here, in the
+   * page, so the rest of the module can never have to ask "is this node a
+   * status row?" - the answer is already `false` by the time it gets here.
+   */
   turns: ObservedTurn[];
 };
 
@@ -53,9 +76,11 @@ export type SendConfirmation = {
   reason: "confirmed" | "no_new_turn" | "new_turn_wrong_task" | "input_not_confirmed" | "timeout";
   /** Identity of the new turn, when one was observed. */
   observedMessageId: string | null;
-  /** How many turns the page rendered before and after the click. */
+  /** How many outbound turns the page had before and after the click. */
   beforeTurnCount: number;
   afterTurnCount: number;
+  /** Non-outbound nodes seen after the click, as evidence of what was ignored. */
+  ignoredRoles: string[];
   detail: string;
 };
 
@@ -131,13 +156,33 @@ export function confirmInputReadback(input: {
 }
 
 /**
+ * The prefix of the outbound text the page has to show for a node to be
+ * identified as the relay's own turn.
+ *
+ * The task id alone is too loose for a page that streams answers: a reply can
+ * quote the id of the task it answers. The first characters of the payload -
+ * which the relay typed into the composer a moment ago, and which the composer
+ * read back - are the send's own identity.
+ */
+export const OUTBOUND_PREFIX_LENGTH = 80;
+
+export function outboundPayloadPrefix(text: string, length = OUTBOUND_PREFIX_LENGTH): string {
+  return collapseWhitespace(text).slice(0, length);
+}
+
+/**
  * Was the click enough? No.
  *
- * A turn that was not there before the click and that carries this task's
- * identifier is the only proof that WorkBuddy accepted the payload. A new
- * turn that carries a different task means the page moved on its own, and no
- * new turn at all means the send is in an unknown state - which is a
- * reconciliation case, never an implicit success.
+ * A *user-authored* turn that was not there before the click and that carries
+ * this task's identifier is the only proof that WorkBuddy accepted the
+ * payload. WorkBuddy's own processing card, answer, status row or system line
+ * may appear right after the click and must simply be waited out: seeing one
+ * is not a send, and calling it one is the production bug this rule exists to
+ * keep out.
+ *
+ * A new user turn that carries a different task means the page moved on on its
+ * own, and no new user turn at all means the send is in an unknown state -
+ * which is a reconciliation case, never an implicit success.
  */
 export function confirmSend(input: {
   before: TurnSnapshot;
@@ -148,30 +193,42 @@ export function confirmSend(input: {
   const after = input.after.turns ?? [];
   const beforeSignatures = new Set(before.map((turn) => turn.signature));
 
-  const fresh = after.find((turn) => !beforeSignatures.has(turn.signature));
+  const fresh = after.filter((turn) => !beforeSignatures.has(turn.signature));
+  const freshUser = fresh.find((turn) => turn.role === "user");
+  /*
+   * Kept as evidence, never as a verdict: an operator has to be able to see
+   * that the page really did move after the click, and which nodes the relay
+   * decided were not the relay's message going out.
+   */
+  const ignoredRoles = fresh.filter((turn) => turn.role !== "user").map((turn) => turn.role);
 
-  if (fresh === undefined) {
+  if (freshUser === undefined) {
     return {
       ok: false,
       reason: "no_new_turn",
       observedMessageId: null,
       beforeTurnCount: before.length,
       afterTurnCount: after.length,
+      ignoredRoles,
       detail:
-        `the page rendered ${after.length} turn(s) after the click and none of them is new, ` +
-        `so whether the task was sent is unknown`,
+        `the page rendered ${after.length} outbound turn(s) after the click and none of them is new, ` +
+        (ignoredRoles.length > 0
+          ? `${ignoredRoles.length} non-outbound node(s) were seen and ignored (${ignoredRoles.join(", ")}), ` +
+            `so whether the task was sent is unknown`
+          : `so whether the task was sent is unknown`),
     };
   }
 
-  if (!fresh.containsTaskId) {
+  if (!freshUser.containsTaskId) {
     return {
       ok: false,
       reason: "new_turn_wrong_task",
-      observedMessageId: fresh.signature,
+      observedMessageId: freshUser.signature,
       beforeTurnCount: before.length,
       afterTurnCount: after.length,
+      ignoredRoles,
       detail:
-        `a new turn appeared but it does not carry task ${input.expectedTaskId}, ` +
+        `a new outbound turn appeared but it does not carry task ${input.expectedTaskId}, ` +
         `so it is not this dispatch going out`,
     };
   }
@@ -179,10 +236,11 @@ export function confirmSend(input: {
   return {
     ok: true,
     reason: "confirmed",
-    observedMessageId: fresh.signature,
+    observedMessageId: freshUser.signature,
     beforeTurnCount: before.length,
     afterTurnCount: after.length,
-    detail: `a new turn carrying task ${input.expectedTaskId} appeared after the click`,
+    ignoredRoles,
+    detail: `a new outbound turn carrying task ${input.expectedTaskId} appeared after the click`,
   };
 }
 

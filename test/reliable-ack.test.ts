@@ -174,22 +174,22 @@ function buildWorkbuddy(share: FakeWorkbuddy, knobs: Knobs): {
           turns,
         });
 
-        const before = snapshot([{ signature: "turn-before", containsTaskId: false }]);
+        const before = snapshot([{ signature: "turn-before", role: "user", containsTaskId: false }]);
         let after: TurnSnapshot;
 
         switch (knobs.delivery) {
           // The button was clicked and no new turn appeared at all.
           case "click_only":
-            after = snapshot([{ signature: "turn-before", containsTaskId: false }]);
+            after = snapshot([{ signature: "turn-before", role: "user", containsTaskId: false }]);
             break;
           // A new turn appeared, but it belongs to a different task.
           case "wrong_task":
-            after = snapshot([{ signature: "turn-other", containsTaskId: false }]);
+            after = snapshot([{ signature: "turn-other", role: "user", containsTaskId: false }]);
             break;
           default:
             after = snapshot([
-              { signature: "turn-before", containsTaskId: false },
-              { signature: `turn-${context.taskId}`, containsTaskId: true },
+              { signature: "turn-before", role: "user", containsTaskId: false },
+              { signature: `turn-${context.taskId}`, role: "user", containsTaskId: true },
             ]);
         }
 

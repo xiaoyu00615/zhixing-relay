@@ -70,6 +70,7 @@ function confirmedAck(outboundId: string): SendAck {
       observedMessageId: outboundId,
       beforeTurnCount: 1,
       afterTurnCount: 2,
+      ignoredRoles: [],
       detail: "a new turn carrying this task is on the page",
     },
     clickOk: true,

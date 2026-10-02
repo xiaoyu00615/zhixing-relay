@@ -1987,6 +1987,43 @@ export class ZhixingRelay {
       };
     }
 
+    /*
+     * The same close, now also usable on a live task: a task the relay itself
+     * froze because the send could not be confirmed.
+     *
+     * The smoke task `relay-production-smoke-v0473c-001` is exactly that
+     * shape - WorkBuddy really ran it, the ledger says the send was never
+     * confirmed, and the relay is sitting on a `currentTask` it cannot prove
+     * either way. A closure row alone does not release it, because the hold
+     * has a second source, the live task. So the close is allowed to clear
+     * *this one* task record, and nothing else moves.
+     *
+     * Refused for exactly one case: the task named *is* the live record, and
+     * that record is not frozen for reconciliation. A task that is running, or
+     * already proven sent, is not ours to close - that is a different
+     * decision, and recording a closure for it would be a second, invented
+     * fact about WorkBuddy.
+     *
+     * A close naming some *other* chain stays a historical close: the live
+     * record belongs to a different task and is never touched by it.
+     */
+    const live = this.store.snapshot().currentTask;
+
+    if (live !== null && live.taskId === taskId) {
+      const stage = live.execution?.stage ?? "none";
+
+      if (stage !== "RECONCILIATION_REQUIRED") {
+        return {
+          ok: false,
+          message:
+            `the live task ${taskId} stands at ${stage}, and only a task frozen for ` +
+            `reconciliation can be closed without a resend`,
+          blocked: this.reconciliationHold,
+          findings: [],
+        };
+      }
+    }
+
     const closed = await this.reconciliation.recordTaskClosedWithoutResend({
       taskId,
       reason: input.reason,
@@ -2004,8 +2041,16 @@ export class ZhixingRelay {
 
     this.noteLedgerWrite();
 
-    // The closure is written first; the chain is re-read with the live state
-    // so the answer describes the world, not the state before the decision.
+    /*
+     * The closure is written first, then the matching live record goes, so a
+     * crash between the two still leaves the ledger holding the decision. The
+     * live record is dropped and nothing else is touched: no requeue, no
+     * enqueue, no dispatch, and no stage the relay never observed.
+     */
+    const liveReleased = await this.releaseLiveReconciliationTask(taskId);
+
+    // The chain is then re-read with the live state, so the answer describes
+    // the world, not the state before the decision.
     const report = await this.runReconciliation(`closed without resend: ${input.reason}`);
 
     if (report === null) {
@@ -2034,6 +2079,10 @@ export class ZhixingRelay {
     const held = this.reconciliationHold;
     const liveHold = this.liveNeedsReconciliation();
     const parts: string[] = [];
+
+    if (liveReleased) {
+      parts.push("the live record for this task was released");
+    }
 
     if (blocking.length > 0) {
       parts.push(`other chains still block scheduling (${blocking.join(", ")})`);
@@ -2066,6 +2115,36 @@ export class ZhixingRelay {
   private liveNeedsReconciliation(): boolean {
     const stage = this.store.snapshot().currentTask?.execution?.stage;
     return stage === "RECONCILIATION_REQUIRED";
+  }
+
+  /**
+   * Drops the live record of one task the operator just closed.
+   *
+   * Only a record that is still frozen for reconciliation gets dropped, and
+   * only the one named by the operator - a running task keeps its record, and
+   * so does a task that belongs to somebody else.
+   *
+   * Nothing is requeued, enqueued or dispatched here, and no stage is written:
+   * the relay did not observe WorkBuddy finish anything, so the record is
+   * simply gone and the ledger row is the only thing it says about the task.
+   */
+  private async releaseLiveReconciliationTask(taskId: string): Promise<boolean> {
+    let released = false;
+
+    await this.store.mutate((state) => {
+      const task = state.currentTask;
+      if (task === null) return;
+      if (task.taskId !== taskId) return;
+      if (task.execution?.stage !== "RECONCILIATION_REQUIRED") return;
+
+      state.currentTask = null;
+      // A pause is an operator decision of its own and outlives a close:
+      // releasing the hold must not silently start scheduling again.
+      if (state.state !== "PAUSED" && state.state !== "STOPPED") state.state = "IDLE";
+      released = true;
+    });
+
+    return released;
   }
 
   /** Reads the ledger and reports on every task it knows about. */

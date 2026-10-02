@@ -24,6 +24,7 @@ import {
   waitForSendConfirmation,
   type RunningConfirmation,
   type RunningSignals,
+  type TurnRole,
   type TurnSnapshot,
 } from "../src/workbuddy/turn-ack.js";
 
@@ -54,10 +55,19 @@ function stepClock(options: { pollIntervalMs: number; timeoutMs: number }): {
   };
 }
 
-function snapshot(turns: Array<[string, boolean]>): TurnSnapshot {
+/**
+ * Builds one page read. The role is explicit, because the fix under test is
+ * exactly that a non-user node cannot vote: a status row is a
+ * `["signature", "assistant"]` tuple and it must stay out of `turns`.
+ */
+function snapshot(turns: Array<[string, TurnRole, boolean?]>): TurnSnapshot {
   return {
     inputText: "",
-    turns: turns.map(([signature, containsTaskId]) => ({ signature, containsTaskId })),
+    turns: turns.map(([signature, role, containsTaskId = false]) => ({
+      signature,
+      role,
+      containsTaskId,
+    })),
   };
 }
 
@@ -191,14 +201,14 @@ describe("input confirmation", () => {
 });
 
 describe("send confirmation", () => {
-  const before = snapshot([["turn-a", false]]);
+  const before = snapshot([["turn-a", "user"]]);
 
   it("confirms only when the click grew a new turn carrying this task", () => {
     const confirmation = confirmSend({
       before,
       after: snapshot([
-        ["turn-a", false],
-        ["turn-t-1", true],
+        ["turn-a", "user"],
+        ["turn-t-1", "user", true],
       ]),
       expectedTaskId: "t-1",
     });
@@ -214,7 +224,7 @@ describe("send confirmation", () => {
   it("does not mistake a successful click for a confirmed send", () => {
     const confirmation = confirmSend({
       before,
-      after: snapshot([["turn-a", false]]),
+      after: snapshot([["turn-a", "user"]]),
       expectedTaskId: "t-1",
     });
 
@@ -225,7 +235,7 @@ describe("send confirmation", () => {
   it("refuses a new turn that belongs to another task", () => {
     const confirmation = confirmSend({
       before,
-      after: snapshot([["turn-other", false]]),
+      after: snapshot([["turn-other", "user"]]),
       expectedTaskId: "t-1",
     });
 
@@ -236,7 +246,7 @@ describe("send confirmation", () => {
   it("reports the turn counts as evidence", () => {
     const confirmation = confirmSend({
       before,
-      after: snapshot([["turn-a", false], ["turn-t-1", true]]),
+      after: snapshot([["turn-a", "user"], ["turn-t-1", "user", true]]),
       expectedTaskId: "t-1",
     });
 
@@ -246,8 +256,8 @@ describe("send confirmation", () => {
 
   it("keeps polling until the new turn shows up, then stops", async () => {
     const after = snapshot([
-      ["turn-a", false],
-      ["turn-t-9", true],
+      ["turn-a", "user"],
+      ["turn-t-9", "user", true],
     ]);
     const clock = stepClock({ pollIntervalMs: 5, timeoutMs: 50 });
     let seen = false;
@@ -256,7 +266,7 @@ describe("send confirmation", () => {
     const confirmation = await waitForSendConfirmation(
       async () => {
         polls += 1;
-        return seen ? after : snapshot([["turn-a", false]]);
+        return seen ? after : snapshot([["turn-a", "user"]]);
       },
       {
         before,
@@ -290,7 +300,7 @@ describe("send confirmation", () => {
     const confirmation = await waitForSendConfirmation(
       async () => {
         polls += 1;
-        return snapshot([["turn-a", false]]);
+        return snapshot([["turn-a", "user"]]);
       },
       {
         before,

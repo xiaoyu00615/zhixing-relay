@@ -12,6 +12,7 @@ import {
   type WorkBuddyTurnSignals,
 } from "./turn-state.js";
 import { type TurnSnapshot } from "./turn-ack.js";
+import { CLASSIFY_TURN_NODE_SOURCE } from "./turn-roles.js";
 
 export type { WorkBuddyState } from "./turn-state.js";
 export type { QuotaDetection, QuotaSignals } from "./quota.js";
@@ -106,8 +107,8 @@ function asString(value: unknown): string {
  * What the page currently contains, for the delivery acknowledgements.
  *
  * The relay only ever sees plain values out of this: turn signatures, whether
- * a turn carries the task's id, and what the composer holds. Deciding what any
- * of it *means* stays in turn-ack.ts, which is unit-testable.
+ * a turn carries the task's id, who authored it, and what the composer holds.
+ * Deciding what any of it *means* stays in turn-ack.ts, which is unit-testable.
  *
  * Selectors that matter:
  *
@@ -117,18 +118,81 @@ function asString(value: unknown): string {
  * A turn signature is the rendered length plus the first characters of the
  * turn's own text: enough to tell "the same turn as before the click" from "a
  * new one", and it never carries the whole body out of the page.
+ *
+ * THE SET, NOT JUST THE PREDICATE, IS THE FIX.
+ *
+ * The previous snapshot collected every `.cr-agent` and let the verdict find
+ * the new one by task id. On the real page the node that appears first after
+ * the click is WorkBuddy's own processing/status card - a `.cr-agent` that
+ * carries no task id at all - so the first verdict of the poll was
+ * `new_turn_wrong_task` for a send that had in fact gone out, and the task
+ * went to reconciliation with a false failure.
+ *
+ * So a container is classified here, and `turns` carries the outbound ones
+ * only. The classification uses the two measured facts the relay already
+ * trusts, in this order:
+ *
+ *   1. user-authored content (`.cr-self-message__content`, measured on the
+ *      live page in src/workbuddy/quota.ts)                        -> user
+ *   2. assistant-side chrome: processing status, completion status,
+ *      cancelled indicator, finished footer, completed collapse, or the
+ *      processing class                                             -> assistant
+ *   3. the labels WorkBuddy renders for its own status card
+ *      ("已处理" / "思考中" / ...)                                    -> assistant
+ *   4. the outbound payload itself, collapsed                       -> user
+ *
+ * Only rule 4 can still go wrong by calling an answer a send, and it needs the
+ * relay's own payload text to appear inside the node - an answer that starts
+ * with 80 characters of the message it is answering could only do that by
+ * quoting it.
  */
-const TURN_SNAPSHOT_EXPRESSION = (taskId: string) => `
+/** Exported so the expression itself, not a copy of it, is under test. */
+export const TURN_SNAPSHOT_EXPRESSION = (request: {
+  taskId: string;
+  payloadPrefix: string;
+}) => `
   (() => {
+    ${CLASSIFY_TURN_NODE_SOURCE}
     const input = document.querySelector('[contenteditable="true"][role="textbox"]');
-    const turns = Array.from(document.querySelectorAll('.cr-agent'));
+    const nodes = Array.from(document.querySelectorAll('.cr-agent'));
+    const taskId = ${JSON.stringify(request.taskId)};
+    const payloadPrefix = ${JSON.stringify(request.payloadPrefix)};
 
-    const observed = turns.map((el, index) => {
+    const observed = nodes.map((el, index) => {
       const text = String(el.innerText || '');
       const signature = text.length + '|' + text.slice(0, 64);
+      const collapsed = text.replace(/\\s+/g, ' ').trim();
+
+      const userContent = el.querySelector('.cr-self-message__content');
+      const processingStatus = el.querySelector('.cr-agent__processing-status');
+      const completionStatus = el.querySelector('.cr-agent__completion-status');
+      const cancelledIndicator = el.querySelector('.cr-cancelled-indicator');
+      const finishedFooter = el.querySelector('.conversation-finished-footer');
+      const completedCollapse = el.querySelector('.cr-collapse--completed');
+      const processingClass = el.classList.contains('cr-agent--processing');
+
+      // The page only collects; the verdict is classifyTurnNode's, and it is
+      // the same function the unit tests call.
+      const role = classifyTurnNode({
+        hasUserContent: !!userContent,
+        hasAssistantChrome: !!(
+          processingStatus ||
+          completionStatus ||
+          cancelledIndicator ||
+          finishedFooter ||
+          completedCollapse ||
+          processingClass
+        ),
+        hasStatusLabel: /已处理|思考中|正在思考|已取消|已完成/.test(collapsed),
+        carriesPayload: collapsed.indexOf(payloadPrefix) !== -1,
+      });
+
       return {
         signature: signature,
-        containsTaskId: text.indexOf(${JSON.stringify(taskId)}) !== -1,
+        role: role,
+        // Identity, kept on every node: only the outbound turns leave the
+        // page, but each of them still has to prove which task it carries.
+        containsTaskId: text.indexOf(taskId) !== -1,
         index: index,
       };
     });
@@ -136,7 +200,10 @@ const TURN_SNAPSHOT_EXPRESSION = (taskId: string) => `
     return JSON.stringify({
       inputText: String(input ? (input.innerText || '') : ''),
       turnCount: observed.length,
-      turns: observed,
+      // The outbound turns, and only those: everything else is filtered out
+      // in the page, so no verdict downstream can mistake a status row for
+      // the relay's message going out.
+      turns: observed.filter((turn) => turn.role === 'user'),
     });
   })()`;
 
@@ -276,11 +343,25 @@ export class WorkBuddyClient {
     return typeof raw === "string" ? raw : "";
   }
 
-  /** What the page renders right now: the turns, and what each of them carries. */
-  async readTurnSnapshot(taskId: string): Promise<TurnSnapshot> {
+  /**
+   * What the page renders right now: the outbound turns, and what each carries.
+   *
+   * Both facts it compares against come from the caller - the task id and the
+   * outbound payload - because the page cannot say which node is the relay's
+   * message; the relay already proved that one when it read the composer back.
+   */
+  async readTurnSnapshot(request: {
+    taskId: string;
+    payloadPrefix: string;
+  }): Promise<TurnSnapshot> {
 
     const raw =
-      await this.cdp.evaluate(TURN_SNAPSHOT_EXPRESSION(taskId));
+      await this.cdp.evaluate(
+        TURN_SNAPSHOT_EXPRESSION({
+          taskId: request.taskId,
+          payloadPrefix: request.payloadPrefix,
+        }),
+      );
 
     if (typeof raw !== "string") return emptyTurnSnapshot();
 
@@ -299,7 +380,12 @@ export class WorkBuddyClient {
           (turn): turn is TurnSnapshot["turns"][number] =>
             typeof turn === "object" &&
             turn !== null &&
-            typeof (turn as { signature?: unknown }).signature === "string",
+            typeof (turn as { signature?: unknown }).signature === "string" &&
+            /*
+             * Second line of defence, and the same rule the pure layer
+             * applies: no role, no vote.
+             */
+            (turn as { role?: unknown }).role === "user",
         ),
       };
     } catch {

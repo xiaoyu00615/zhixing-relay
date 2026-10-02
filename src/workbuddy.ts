@@ -9,6 +9,7 @@ import type { WorkBuddyMessage } from "./types.js";
 import { waitForTurn } from "./workbuddy/turn-state.js";
 import {
   confirmInputReadback,
+  outboundPayloadPrefix,
   waitForRunning as waitForRunningConfirmation,
   waitForSendConfirmation,
   type InputConfirmation,
@@ -143,6 +144,7 @@ async sendText(
       observedMessageId: null,
       beforeTurnCount: 0,
       afterTurnCount: 0,
+      ignoredRoles: [],
       detail,
     },
     clickOk: false,
@@ -174,7 +176,16 @@ async sendText(
     return failed("input_not_confirmed", `input readback rejected: ${input.reason}`, input);
   }
 
-  const before = await this.cdpClient.readTurnSnapshot(context.taskId);
+  /*
+   * The snapshot needs the outbound payload itself, not only the task id: on
+   * a page where WorkBuddy's own status card is the first node to appear after
+   * a click, the payload is what separates "the relay's message going out"
+   * from "something on the assistant side moved".
+   */
+  const before = await this.cdpClient.readTurnSnapshot({
+    taskId: context.taskId,
+    payloadPrefix: outboundPayloadPrefix(text),
+  });
   const clicked = await this.cdpClient.clickSendButton();
 
   const send =
@@ -185,10 +196,15 @@ async sendText(
           observedMessageId: null,
           beforeTurnCount: before.turns.length,
           afterTurnCount: before.turns.length,
+          ignoredRoles: [],
           detail: `the send button was not clicked (${clicked.detail}); nothing was sent`,
         }
       : await waitForSendConfirmation(
-          () => this.cdpClient.readTurnSnapshot(context.taskId),
+          () =>
+            this.cdpClient.readTurnSnapshot({
+              taskId: context.taskId,
+              payloadPrefix: outboundPayloadPrefix(text),
+            }),
           {
             before,
             expectedTaskId: context.taskId,
