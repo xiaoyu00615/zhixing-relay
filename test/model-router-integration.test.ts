@@ -213,12 +213,11 @@ beforeAll(async () => {
 
 afterAll(async () => {
   /*
-   * Removed once at the end: a late write from a settled wait must not race
-   * against a directory that no longer exists. The drain and the retries cover
-   * the other side of that race - a write still in flight when this runs,
-   * which leaves the directory non-empty and the removal failing.
+   * Removed once at the end, with no fixed wait in front of it: every test is
+   * released by `afterEach` the moment it finishes, so nothing is still
+   * writing when the removal runs. The retries only absorb the cost of the
+   * recursive delete itself, which is slow for a few hundred small files.
    */
-  await new Promise((resolve) => setTimeout(resolve, 20));
   await rm(sandboxRoot, {
     recursive: true,
     force: true,
@@ -233,10 +232,20 @@ afterAll(async () => {
 }, 60_000);
 
 afterEach(async () => {
-  // No global hook registry to drain any more: every wait resolver lives on
-  // its own DispatchRecord, so a task that was left hanging dies with the
-  // harness and cannot leak into the next test.
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  /*
+   * No global hook registry to drain any more: every wait resolver lives on
+   * its own DispatchRecord, so a task that was left hanging dies with the
+   * harness and cannot leak into the next test.
+   *
+   * The loops below release what the finished test owned, newest first, in
+   * place of a timer whose length would only be a guess. Nothing sleeps here:
+   * a relay's background work is a set the relay exposes, so `dispose()` waits
+   * for a fact instead of hoping a delay was long enough.
+   */
+  while (openShutdowns.length > 0) {
+    const open = openShutdowns.pop();
+    await open?.release();
+  }
 });
 
 function fakeAudit(sink: { event: string; payload: Record<string, unknown> }[]): AuditLog {
@@ -257,6 +266,39 @@ async function makeHarness(
 
   const store = new RelayStore(pathToFileURL(join(dir, "state.json")));
   await store.load();
+
+  /*
+   * This harness owns its timers. They are registered here and stopped when
+   * the suite releases this harness, so a poll outliving its test can no more
+   * write into this directory than the relay itself can after being disposed.
+   */
+  const scope = new TimerScope();
+  /*
+   * Three things, in this order, and none of them a pause:
+   *
+   *  1. the waits this harness created are released - it owns their resolvers,
+   *     so no relay can finish a step it is still waiting on if the harness
+   *     does not let it;
+   *  2. its timers are stopped, so no poll can reach a relay that is going;
+   *  3. the relay is disposed, which cancels its round and then waits for the
+   *     background work that leaves behind.
+   *
+   * Only after all three may the directory go away. Waiting a fixed interval
+   * instead would be a guess about how long step 3 takes, and a step held by
+   * an unreleased wait would prove every guess wrong.
+   */
+  const shutdown = async (): Promise<void> => {
+    /*
+     * Cancelled, not completed. `dispose()` aborts the round first, so a wait
+     * that is still hanging ends instead of running a whole turn to its end
+     * for a test that is already over, and then drains whatever that left.
+     *
+     * Timers stop last, because the drain can still let a step start another
+     * poll; stopping first would leave that poll on a scope nobody clears.
+     */
+    await relay.dispose();
+    scope.stopAll();
+  };
 
   const router = new ModelRouter({
     models,
@@ -340,11 +382,11 @@ async function makeHarness(
          * waits for the record to say `sent_to_gpt`, so it can never ack a
          * delivery that has not happened yet.
          */
-        const waiter = setInterval(() => {
+        const waiter = scope.every(2, () => {
           if (store.snapshot().currentTask?.status !== "sent_to_gpt") return;
           clearInterval(waiter);
-          if (h.autoAck) ackSend(messageHandler, message.requestId);
-        }, 2);
+          if (h.autoAck) ackSend(messageHandler, message.requestId, scope);
+        });
       }
     },
     close: async () => {},
@@ -441,8 +483,20 @@ async function makeHarness(
           return { outcome: "timeout", ok: false, reason: "nothing moved", evidence };
       }
     },
-    waitForAssistantReply: async () => {
+    waitForAssistantReply: async (
+      _outboundId: string,
+      options?: { signal?: AbortSignal },
+    ) => {
       record("workbuddy.wait");
+
+      /*
+       * Already cancelled: an "abort" event that fired before this wait began
+       * never arrives, so the state has to be read, the way a real client
+       * does before it starts waiting.
+       */
+      if (options?.signal?.aborted) {
+        throw new Error("WorkBuddy wait cancelled: the relay stopped waiting");
+      }
 
       if (h.waitOutcome) {
         if (!h.waitOutcome.ok) throw new Error(h.waitOutcome.error);
@@ -453,19 +507,31 @@ async function makeHarness(
         };
       }
 
-      // Hangs on purpose: several tests inspect state mid-turn. The resolver
-      // is registered on THIS dispatch only, so settling one task cannot
-      // finish another one that happens to be waiting.
-      return new Promise((resolve) => {
+      /*
+       * Hangs on purpose: several tests inspect state mid-turn. The resolver
+       * is registered on THIS dispatch only, so settling one task cannot
+       * finish another one that happens to be waiting.
+       *
+       * It also honours the relay's abort signal, which is the piece a
+       * shutdown depends on: a wait the relay cancels has to end, otherwise
+       * there is nothing a drain could wait for.
+       */
+      return new Promise((resolve, reject) => {
+        const cancelled = (): void => {
+          reject(new Error("WorkBuddy wait cancelled: the relay stopped waiting"));
+        };
+        options?.signal?.addEventListener("abort", cancelled, { once: true });
+
         records
           .find((r) => r.id === activeDispatchId)
-          ?.waitHooks.push(() =>
+          ?.waitHooks.push(() => {
+            options?.signal?.removeEventListener("abort", cancelled);
             resolve({
               text: h.waitOutcome?.ok ? (h.waitOutcome.text ?? "RESULT BODY") : "RESULT BODY",
               lastMessageId: "wb-1",
               assistantMessages: [],
-            }),
-          );
+            });
+          });
       });
     },
     detectQuota: async (): Promise<QuotaDetection> => {
@@ -541,6 +607,9 @@ async function makeHarness(
   });
 
   const relay = new ZhixingRelay(config, bridge, store, fakeAudit(auditEvents), workbuddy, traced);
+
+  // Registered as soon as it exists, so no test can finish with it alive.
+  openShutdowns.push({ release: shutdown });
 
   // Registers the bridge handler, so tests can push any inbound message.
   await relay.init();
@@ -681,24 +750,77 @@ function timeline(calls: Call[]): string[] {
 }
 
 /**
+ * Ownership for the timers one test's fakes create.
+ *
+ * This exists because of a real race: a fake extension poller was left
+ * running after its test ended, and once the suite removed the temporary
+ * directory the poll fired anyway and wrote a stage into a store whose files
+ * were gone. A timer nobody can stop is a write nobody can wait for, so every
+ * timer here is registered and stopped by `stopAll()`.
+ */
+class TimerScope {
+  private readonly intervals = new Set<NodeJS.Timeout>();
+  private readonly timeouts = new Set<NodeJS.Timeout>();
+
+  /** A repeating tick, stopped by `stopAll()`. */
+  every(ms: number, run: () => void): NodeJS.Timeout {
+    const id = setInterval(run, ms);
+    this.intervals.add(id);
+    return id;
+  }
+
+  /** One tick, stopped by `stopAll()`. */
+  later(ms: number, run: () => void): NodeJS.Timeout {
+    const id = setTimeout(run, ms);
+    this.timeouts.add(id);
+    return id;
+  }
+
+  stopAll(): void {
+    for (const id of this.intervals) clearInterval(id);
+    for (const id of this.timeouts) clearTimeout(id);
+    this.intervals.clear();
+    this.timeouts.clear();
+  }
+}
+
+/**
+ * Shutdown steps the suite still owes.
+ *
+ * Each entry is exactly what a test created - its timers and its relays,
+ * nothing more. Between tests these are drained, which is what makes deleting
+ * the temporary directory safe: the work that could have written into it has
+ * already finished.
+ */
+const openShutdowns: Array<{ release: () => Promise<void> }> = [];
+
+/**
  * A fake extension acknowledging a RESULT delivery.
  *
  * The acknowledgement travels on a macrotask on purpose: the relay records the
  * delivery first and only then moves the record to `sent_to_gpt`, so an ack
  * fired inside the same tick would arrive before the delivery existed.
+ *
+ * `scope` owns the macrotask. Without one the ack is still sent, it just
+ * nobody can stop it, which is how this suite once wrote into a deleted
+ * directory.
  */
 function ackSend(
   handler: ((message: ExtensionInbound) => Promise<void>) | null,
   requestId?: string,
+  scope?: TimerScope,
 ): void {
-  setTimeout(() => {
+  const fire = (): void => {
     void handler?.({
       type: "chatgpt_send_result",
       requestId: requestId ?? null,
       ok: true,
       sent: true,
     });
-  }, 0);
+  };
+
+  if (scope) scope.later(0, fire);
+  else setTimeout(fire, 0);
 }
 
 /**
@@ -1030,6 +1152,22 @@ describe("model router <> relay integration", () => {
     });
     await freshRouter.init();
 
+    /*
+     * Owned by the suite just like the main harness: this relay is disposed,
+     * its timers stopped and its waits released, even though the test creates
+     * it inline. A wait a test holds open is released here and nowhere else,
+     * because the drain that follows can only finish once nothing is waiting.
+     */
+    const freshScope = new TimerScope();
+    const freshWaits: Array<() => void> = [];
+    openShutdowns.push({
+      release: async () => {
+        // Disposed before the timers stop, for the same reason as above.
+        await freshRelay.dispose();
+        freshScope.stopAll();
+      },
+    });
+
     const freshRelay = new ZhixingRelay(
       {
         relay: {
@@ -1056,7 +1194,30 @@ describe("model router <> relay integration", () => {
         selectModel: async () => ({ changed: false, previous: "Hy3", current: "Hy3" }),
         sendText: async () => "wb-1",
         waitForRunning: async () => RUNNING,
-        waitForAssistantReply: () => new Promise(() => {}),
+        /*
+         * Hangs for the whole test - it only reads the pin - but it is owned:
+         * a wait nobody can release cannot be drained, so the suite releases
+         * this one when the test ends.
+         */
+        waitForAssistantReply: (_id: string, options?: { signal?: AbortSignal }) =>
+          new Promise((resolve, reject) => {
+            if (options?.signal?.aborted) {
+              reject(new Error("WorkBuddy wait cancelled: the relay stopped waiting"));
+              return;
+            }
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error("WorkBuddy wait cancelled: the relay stopped waiting")),
+              { once: true },
+            );
+            freshWaits.push(() =>
+              resolve({
+                text: "RESULT BODY",
+                lastMessageId: "wb-1",
+                assistantMessages: [],
+              }),
+            );
+          }),
       } as unknown as WorkBuddyClient,
       freshRouter,
     );
@@ -1087,6 +1248,22 @@ describe("model router <> relay integration", () => {
     /** Everything the recovered turn typed into WorkBuddy. */
     const sent: string[] = [];
 
+    /*
+     * Owned by the suite just like the main harness: this relay is disposed,
+     * its timers stopped and its waits released, even though the test creates
+     * it inline. A wait a test holds open is released here and nowhere else,
+     * because the drain that follows can only finish once nothing is waiting.
+     */
+    const freshScope = new TimerScope();
+    const freshWaits: Array<() => void> = [];
+    openShutdowns.push({
+      release: async () => {
+        // Disposed before the timers stop, for the same reason as above.
+        await freshRelay.dispose();
+        freshScope.stopAll();
+      },
+    });
+
     const freshRelay = new ZhixingRelay(
       {
         relay: {
@@ -1104,11 +1281,11 @@ describe("model router <> relay integration", () => {
         // The RESULT the recovered turn forwards has to be observable here.
         send: async (message: { text: string; requestId?: string }) => {
           h.sentToChatGpt.push(message.text);
-          const waiter = setInterval(() => {
+          const waiter = freshScope.every(2, () => {
             if (h.store.snapshot().currentTask?.status !== "sent_to_gpt") return;
             clearInterval(waiter);
-            ackSend(freshInbound, message.requestId);
-          }, 2);
+            ackSend(freshInbound, message.requestId, freshScope);
+          });
         },
         close: async () => {},
       } as unknown as BridgeServer,
@@ -1184,6 +1361,22 @@ describe("model router <> relay integration", () => {
       assistantMessages: [];
     } => ({ text: "RESULT BODY", lastMessageId: "wb-2", assistantMessages: [] });
 
+    /*
+     * Owned by the suite just like the main harness: this relay is disposed,
+     * its timers stopped and its waits released, even though the test creates
+     * it inline. A wait a test holds open is released here and nowhere else,
+     * because the drain that follows can only finish once nothing is waiting.
+     */
+    const freshScope = new TimerScope();
+    const freshWaits: Array<() => void> = [];
+    openShutdowns.push({
+      release: async () => {
+        // Disposed before the timers stop, for the same reason as above.
+        await freshRelay.dispose();
+        freshScope.stopAll();
+      },
+    });
+
     const freshRelay = new ZhixingRelay(
       {
         relay: {
@@ -1201,11 +1394,11 @@ describe("model router <> relay integration", () => {
         // The RESULT the recovered turn forwards has to be observable here.
         send: async (message: { text: string; requestId?: string }) => {
           h.sentToChatGpt.push(message.text);
-          const waiter = setInterval(() => {
+          const waiter = freshScope.every(2, () => {
             if (h.store.snapshot().currentTask?.status !== "sent_to_gpt") return;
             clearInterval(waiter);
-            ackSend(freshInbound, message.requestId);
-          }, 2);
+            ackSend(freshInbound, message.requestId, freshScope);
+          });
         },
         close: async () => {},
       } as unknown as BridgeServer,
@@ -1224,8 +1417,17 @@ describe("model router <> relay integration", () => {
           return confirmedAck("wb-2");
         },
         waitForRunning: async () => RUNNING,
-        waitForAssistantReply: () =>
-          new Promise((resolve) => {
+        waitForAssistantReply: (_id: string, options?: { signal?: AbortSignal }) =>
+          new Promise((resolve, reject) => {
+            if (options?.signal?.aborted) {
+              reject(new Error("WorkBuddy wait cancelled: the relay stopped waiting"));
+              return;
+            }
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error("WorkBuddy wait cancelled: the relay stopped waiting")),
+              { once: true },
+            );
             pendingWaits.push(() => resolve(answer()));
           }),
         // Exhausted once - exactly like the one-shot probe in the main harness.

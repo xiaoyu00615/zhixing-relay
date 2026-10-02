@@ -50,6 +50,29 @@ import {
 
 export class ZhixingRelay {
   private workAbort: AbortController | null = null;
+  /**
+   * Every wait-cancellation controller this relay has armed.
+   *
+   * One controller is not enough to cancel with: a recovered wait keeps the
+   * signal it was given while the pipeline arms another one for the next
+   * step, so cancelling "the current" one would leave the earlier wait
+   * running. Cancelling all of them is the only honest reading of "stop".
+   */
+  private readonly armedAborts = new Set<AbortController>();
+  /**
+   * Every background step this relay started and has not finished yet.
+   *
+   * A step is tracked here rather than left to float so that a shutdown has
+   * something to wait on: "no state write is still in flight" is a fact about
+   * this set, not a claim a caller has to guess at.
+   */
+  private readonly backgroundWork = new Set<Promise<void>>();
+  /**
+   * Set once the relay is shut down. Past this, no step may start and no
+   * inbound message may be written, which is what keeps a late write from
+   * landing in a directory that no longer exists.
+   */
+  private disposed = false;
   /** Owns the RESULT lifecycle: persist, deliver, acknowledge, and its lease. */
   private readonly results: ResultPipeline;
   /** Owns the dispatch execution pipeline: route, send, wait, quota fallback. */
@@ -156,6 +179,15 @@ export class ZhixingRelay {
       noteActivity: () => this.noteTaskActivity(),
       workAbort: () => this.workAbort,
       setWorkAbort: (controller) => {
+        /*
+         * A wait armed after the shutdown began was cancelled before it
+         * existed. Aborting it here is what lets that step end instead of
+         * hanging on an answer nobody is waiting for any more.
+         */
+        if (controller) {
+          this.armedAborts.add(controller);
+          if (this.disposed) controller.abort();
+        }
         this.workAbort = controller;
       },
     });
@@ -205,7 +237,7 @@ export class ZhixingRelay {
       );
     }
 
-    this.bridge.onMessage((message) => this.onExtensionMessage(message));
+    this.bridge.onMessage((message) => this.handleExtensionMessage(message));
 
     // The ledger is checked once at start-up: a restart that left a task
     // half-way is exactly the case a reconciliation pass exists to describe.
@@ -554,7 +586,31 @@ export class ZhixingRelay {
    * crash.
    */
   private scheduleWork(step: () => Promise<void>): void {
-    void Promise.resolve()
+    void this.trackWork(step);
+  }
+
+  /**
+   * Starts a step and keeps it visible until it settles.
+   *
+   * The rejection is caught and printed rather than left to float, which is
+   * what keeps a background dispatch - or an inbound turn nobody awaited -
+   * from turning into an unhandled rejection: the one way a fast-returning
+   * call could still look like a crash.
+   */
+  private trackWork(step: () => Promise<void>): Promise<void> {
+    if (this.disposed) {
+      /*
+       * Shutting down. Starting a step now would write to a record nobody
+       * owns any more, so it is dropped instead - the round it belonged to is
+       * already over and the caller that wanted it has gone away.
+       */
+      console.warn(
+        "[relay] background step dropped: the relay is shutting down and no longer owns work",
+      );
+      return Promise.resolve();
+    }
+
+    const run = Promise.resolve()
       .then(step)
       .catch((error: unknown) => {
         console.error(
@@ -563,11 +619,90 @@ export class ZhixingRelay {
           }`,
         );
       });
+
+    this.backgroundWork.add(run);
+    // The rejection is handled above, so this cannot itself float.
+    void run.then(() => {
+      this.backgroundWork.delete(run);
+    });
+
+    return run;
+  }
+
+  /** How many background steps are still running. */
+  backgroundWorkPending(): number {
+    return this.backgroundWork.size;
+  }
+
+  /**
+   * Waits until every background step the relay started has finished.
+   *
+   * A step may start another one, so this keeps going while the set is not
+   * empty. It sleeps for nothing and guesses nothing: when it returns, the
+   * number of steps still running is zero.
+   */
+  async drainBackgroundWork(): Promise<void> {
+    // A step starting another one must not spin forever; the bound only ends
+    // the drain, it never hides work, because `backgroundWorkPending()` would
+    // still report the work nobody ever waited for.
+    for (let rounds = 0; rounds < 1_000 && this.backgroundWork.size > 0; rounds += 1) {
+      await Promise.all([...this.backgroundWork]);
+    }
+  }
+
+  /**
+   * Cancels every wait this relay armed.
+   *
+   * All of them, not just the latest: a recovered wait holds the signal it was
+   * handed while the pipeline arms another for the next step, so cancelling
+   * only the newest would leave the older wait hanging on an answer that has
+   * no round left to answer to.
+   */
+  cancelArmedWaits(): void {
+    for (const controller of this.armedAborts) controller.abort();
+    this.armedAborts.clear();
+    this.workAbort?.abort();
+    this.workAbort = null;
+  }
+
+  /**
+   * Shuts the relay down: nothing new starts, and the work already running
+   * finishes before this resolves.
+   *
+   * A running process keeps using `stopCurrentRound()` and `emergencyStop()`,
+   * both of which leave the relay able to serve the next round. This is the
+   * "the process is going away" path: a caller that needs the relay's files
+   * untouched afterwards - a test removing its directory, for instance - can
+   * only be sure once this resolves.
+   *
+   * Cancellation comes first, because the drain can only finish for work that
+   * is not being held: the wait is aborted and the timers are stopped, so what
+   * is left is work that already has everything it needs. A step still blocked
+   * on a promise outside the relay - an answer nobody will ever send - is that
+   * owner's to release, not this method's to wait for.
+   */
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+
+    this.disposed = true;
+    this.cancelArmedWaits();
+    this.stopHeartbeat();
+    // The lease is a timer, so releasing it here is part of the same claim as
+    // the drain below: no write is left armed behind this method.
+    this.results.clearLease();
+
+    await this.drainBackgroundWork();
+
+    /*
+     * Again, because a step that finished inside the drain may have armed a
+     * lease before it ended. Nothing may stay armed once the relay is gone:
+     * a lease is a timer, and a timer is a write waiting to happen.
+     */
+    this.results.clearLease();
   }
 
   async stopCurrentRound(reason = "manual"): Promise<void> {
-    this.workAbort?.abort();
-    this.workAbort = null;
+    this.cancelArmedWaits();
     this.results.clearLease();
 
     const snapshot = this.store.snapshot();
@@ -621,6 +756,30 @@ export class ZhixingRelay {
       text,
       autoSend,
     });
+  }
+
+  /**
+   * Handles one message from the extension.
+   *
+   * The handling is tracked like any other step the relay starts, because the
+   * bridge does not await it: a turn in flight is relay-owned work, and a
+   * shutdown that cannot see it cannot wait for it.
+   */
+  async handleExtensionMessage(message: ExtensionInbound): Promise<void> {
+    if (this.disposed) {
+      /*
+       * The relay shut down before this message arrived. Answering it would
+       * mean writing a stage for a round that no longer exists, so the ack is
+       * dropped: a late confirmation is not a task.
+       */
+      console.warn(
+        `[relay] dropping ${message.type} from the extension: the relay is shutting down, ` +
+          `so this message belongs to a round that no longer exists`,
+      );
+      return;
+    }
+
+    await this.trackWork(() => this.onExtensionMessage(message));
   }
 
   private async onExtensionMessage(message: ExtensionInbound): Promise<void> {
@@ -933,7 +1092,7 @@ export class ZhixingRelay {
       }
     }
 
-    this.workAbort = new AbortController();
+    this.armedAborts.add((this.workAbort = new AbortController()));
 
     await this.audit.write("workbuddy_wait_resumed", {
       taskId,
@@ -1568,6 +1727,17 @@ export class ZhixingRelay {
     resultId?: string | null;
     detail?: Record<string, unknown> | null;
   }): Promise<TaskExecutionState | null> {
+    if (this.disposed) {
+      /*
+       * Same rule as the inbound guard above, one layer down: a stage move
+       * needs a live round to move, and after a shutdown there is none.
+       */
+      console.warn(
+        `[relay] dropping ${args.stage}: the relay is shutting down, so nothing owns this task`,
+      );
+      return null;
+    }
+
     const now = isoNow();
     const live = this.store.snapshot().currentTask;
     const current = args.execution === undefined ? live?.execution ?? null : args.execution;
