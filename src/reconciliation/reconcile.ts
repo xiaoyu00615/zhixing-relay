@@ -1,6 +1,7 @@
 import { fingerprintShort, identityFingerprints, UNKNOWN_FINGERPRINT } from "./fingerprint.js";
 import {
   hasProvenSend,
+  hasUncertainSend,
   isClosingDisposition,
   terminalStateFor,
   type TerminalKind,
@@ -112,6 +113,7 @@ const PIPELINE: readonly ReconciliationEventName[] = [
   "TASK_ENQUEUED",
   "DISPATCH_STARTED",
   "INPUT_CONFIRMED",
+  "SEND_ATTEMPTED",
   "SEND_CONFIRMED",
   "RUNNING_CONFIRMED",
   "RESULT_RECEIVED",
@@ -474,7 +476,18 @@ export function reconcileTask(
    * This boolean is the only answer to "may this task be sent again".
    */
   const mayResend =
-    !blocking && !terminalStands && has("TASK_REQUEUED") && !hasProvenSend(evidence);
+    !blocking &&
+    !terminalStands &&
+    has("TASK_REQUEUED") &&
+    !hasProvenSend(evidence) &&
+    /*
+     * A send that was attempted and never confirmed vetoes the retry here for
+     * the same reason it vetoes one in `decideDispatch`: the click may have
+     * landed. Asking the same policy keeps the report and the gate from
+     * disagreeing - a report that advertises a resend the dispatcher will
+     * refuse is the diagnostic drift this boolean exists to prevent.
+     */
+    !hasUncertainSend(evidence);
 
   /*
    * The same fact, printed. It used to be computed a second time under a

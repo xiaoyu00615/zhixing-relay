@@ -18,6 +18,17 @@ export type TaskExecutionStage =
   | "QUEUED"
   | "DISPATCHING"
   | "INPUT_CONFIRMED"
+  /**
+   * The irreversible send is about to happen, and the fact that it was
+   * *attempted* is already durable.
+   *
+   * This is a fence, not evidence that anything ran. It exists so that a crash
+   * between "the relay is about to click" and "the relay knows whether the
+   * click landed" cannot be read as a safe retry: past this line the send
+   * outcome is unknown, and unknown is answered by freezing, never by
+   * sending again.
+   */
+  | "SEND_ATTEMPTED"
   | "SEND_CONFIRMED"
   | "RUNNING_CONFIRMED"
   | "RESULT_RECEIVED"
@@ -34,6 +45,7 @@ export const TASK_EXECUTION_STAGES: readonly TaskExecutionStage[] = [
   "QUEUED",
   "DISPATCHING",
   "INPUT_CONFIRMED",
+  "SEND_ATTEMPTED",
   "SEND_CONFIRMED",
   "RUNNING_CONFIRMED",
   "RESULT_RECEIVED",
@@ -51,6 +63,7 @@ const PIPELINE: readonly TaskExecutionStage[] = [
   "QUEUED",
   "DISPATCHING",
   "INPUT_CONFIRMED",
+  "SEND_ATTEMPTED",
   "SEND_CONFIRMED",
   "RUNNING_CONFIRMED",
   "RESULT_RECEIVED",
@@ -75,13 +88,14 @@ const STAGE_RANK: Record<TaskExecutionStage, number> = {
   QUEUED: 0,
   DISPATCHING: 1,
   INPUT_CONFIRMED: 2,
-  SEND_CONFIRMED: 3,
-  RUNNING_CONFIRMED: 4,
-  RESULT_RECEIVED: 5,
-  RESULT_PERSISTED: 6,
-  RESULT_DELIVERED: 7,
-  RESULT_ACKED: 8,
-  COMPLETED: 9,
+  SEND_ATTEMPTED: 3,
+  SEND_CONFIRMED: 4,
+  RUNNING_CONFIRMED: 5,
+  RESULT_RECEIVED: 6,
+  RESULT_PERSISTED: 7,
+  RESULT_DELIVERED: 8,
+  RESULT_ACKED: 9,
+  COMPLETED: 10,
   RECONCILIATION_REQUIRED: -1,
   BLOCKED: -2,
   FAILED: -3,

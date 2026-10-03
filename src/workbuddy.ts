@@ -18,6 +18,28 @@ import {
 } from "./workbuddy/turn-ack.js";
 
 
+/**
+ * The lifecycle seams `sendText` needs from whoever owns the ledger.
+ *
+ * The adapter deliberately knows nothing about tasks, stages or proofs: it
+ * reports mechanics and lets the pipeline decide what is durable and when. What
+ * it does insist on is the ORDER, because two of these moments sit either side
+ * of an irreversible click:
+ *
+ *   onInputConfirmed  the composer really holds this payload (nothing clicked)
+ *   onBeforeClick     the send attempt is durably fenced
+ *
+ * `onBeforeClick` is awaited. That await is the whole point: the fence has to
+ * be on disk *before* the click, so a crash in the click leaves behind a
+ * recorded "a send was attempted here" rather than a task that looks never
+ * tried. If it rejects, the click does not happen at all.
+ */
+export type SendLifecycle = {
+  onInputConfirmed?: (input: InputConfirmation) => Promise<void>;
+  /** Must resolve only once the attempt is durably recorded. */
+  onBeforeClick?: (input: InputConfirmation) => Promise<void>;
+};
+
 /** What the relay gets back from handing a task to WorkBuddy. */
 export type SendAck = {
   /** The outbound message WorkBuddy is expected to answer. */
@@ -31,6 +53,12 @@ export type SendAck = {
   send: SendConfirmation;
   /** True when the send button was clicked at all. */
   clickOk: boolean;
+  /**
+   * Why the click did not happen, when it did not. `button_missing` means the
+   * page offered nothing to click, so no side effect was possible; anything
+   * else leaves the outcome unknown.
+   */
+  clickOutcome: "clicked" | "button_missing" | "fence_refused";
 };
 
 export class WorkBuddyClient {
@@ -115,8 +143,14 @@ export class WorkBuddyClient {
  *
  *   type            the payload goes into the composer
  *   confirmInput    the composer is read back and compared with the payload
- *   click           send is clicked (only after a confirmed input)
+ *   onInputConfirmed  the pipeline records that, durably
+ *   onBeforeClick   the pipeline fences the send attempt, durably
+ *   click           send is clicked (only after both of the above)
  *   confirmSend     the page is watched for a NEW turn carrying this task
+ *
+ * The two seams around the click exist because a click cannot be taken back.
+ * Both are awaited, and a rejecting `onBeforeClick` stops the click outright:
+ * an unfenced send is exactly the duplicate this ordering prevents.
  *
  * A click that produced no new turn is reported as `send.ok === false`, never
  * as a success: after the click the world is genuinely unknown, and unknown is
@@ -128,13 +162,15 @@ async sendText(
     taskId: string;
     pollIntervalMs: number;
     sendConfirmTimeoutMs: number;
-  }
+  },
+  lifecycle: SendLifecycle = {},
 ):Promise<SendAck>{
 
   const failed = (
     reason: SendConfirmation["reason"],
     detail: string,
     input: InputConfirmation,
+    clickOutcome: SendAck["clickOutcome"] = "button_missing",
   ): SendAck => ({
     outboundId: "cdp-" + Date.now(),
     input,
@@ -148,6 +184,7 @@ async sendText(
       detail,
     },
     clickOk: false,
+    clickOutcome,
   });
 
   const unconfirmed = (): InputConfirmation => ({
@@ -177,6 +214,13 @@ async sendText(
   }
 
   /*
+   * The composer holds the payload and nothing has been clicked yet. This is
+   * the safe point at which the pipeline may record INPUT_CONFIRMED durably:
+   * it is a statement about the composer, never about the send.
+   */
+  await lifecycle.onInputConfirmed?.(input);
+
+  /*
    * The snapshot needs the outbound payload itself, not only the task id: on
    * a page where WorkBuddy's own status card is the first node to appear after
    * a click, the payload is what separates "the relay's message going out"
@@ -186,6 +230,27 @@ async sendText(
     taskId: context.taskId,
     payloadPrefix: outboundPayloadPrefix(text),
   });
+
+  /*
+   * The fence, immediately before the irreversible act.
+   *
+   * If this rejects, the click is abandoned: an unfenced click is the one
+   * failure this whole ordering exists to prevent, so the safe reading of a
+   * ledger that could not record the attempt is "do not send".
+   */
+  try {
+    await lifecycle.onBeforeClick?.(input);
+  } catch (error) {
+    return failed(
+      "input_not_confirmed",
+      `the send attempt was not fenced, so nothing was clicked: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      input,
+      "fence_refused",
+    );
+  }
+
   const clicked = await this.cdpClient.clickSendButton();
 
   const send =
@@ -218,6 +283,7 @@ async sendText(
     input,
     send,
     clickOk: clicked.clickOk,
+    clickOutcome: clicked.clickOk ? "clicked" : "button_missing",
   };
 
 }

@@ -2,7 +2,7 @@ import type { AppConfig } from "../config.js";
 import type { AuditLog } from "../audit.js";
 import type { RelayStore } from "../store.js";
 import type { WorkBuddyMessage } from "../types.js";
-import type { WorkBuddyClient } from "../workbuddy.js";
+import type { WorkBuddyClient, SendLifecycle } from "../workbuddy.js";
 import type { ModelRouter } from "../model-router/router.js";
 import type { ModelSelection, ModelUnavailableReason } from "../model-router/types.js";
 import type { ReconciliationService } from "../reconciliation/index.js";
@@ -626,28 +626,110 @@ export class DispatchPipeline {
         await this.applyRoutedModel(taskId, current);
       }
 
-      const ack = await deps.workbuddy.sendText(text, {
-        taskId,
-        pollIntervalMs: deps.config.workbuddy.pollIntervalMs,
-        sendConfirmTimeoutMs: deps.config.relay.sendConfirmTimeoutMs,
-      });
+      /*
+       * The lifecycle, in the only order that is safe.
+       *
+       * `sendText` reports mechanics; these two callbacks are where the round's
+       * durable facts are written, and the adapter awaits them in sequence. The
+       * order is the fix for a P0: the send-attempt fence is on disk BEFORE the
+       * click, so a crash during the click leaves a recorded "a send was
+       * attempted here" rather than a task that looks never tried - and a task
+       * that looks never tried is exactly what used to get sent again.
+       *
+       * INPUT_CONFIRMED is a statement about the composer only. It is not send
+       * proof and it does not close the retry region: past it the send simply
+       * has not been attempted yet.
+       */
+      const sendLifecycle: SendLifecycle = {
+        onInputConfirmed: async (input) => {
+          await deps.noteStage({
+            taskId,
+            taskFingerprint: sendFingerprint,
+            dispatchId: sendId,
+            attempt: sendAttempt,
+            stage: "INPUT_CONFIRMED",
+            ledgerEvent: "INPUT_CONFIRMED",
+            detail: { ...input, composer: input.reason },
+          });
+        },
+        onBeforeClick: async (input) => {
+          /*
+           * The fence. Durable BEFORE the click, and the last durable thing
+           * this relay does before an effect it cannot take back.
+           */
+          await deps.noteStage({
+            taskId,
+            taskFingerprint: sendFingerprint,
+            dispatchId: sendId,
+            attempt: sendAttempt,
+            stage: "SEND_ATTEMPTED",
+            ledgerEvent: "SEND_ATTEMPTED",
+            detail: {
+              composer: input.reason,
+              /*
+               * Recorded so a later reader can tell a fence that preceded a
+               * click from one that did not: a crash between this row and the
+               * click still means the send outcome is unknown, and the fence is
+               * deliberately taken to be the pessimistic reading.
+               */
+              note: "send attempt fenced; the click follows immediately",
+            },
+          });
+        },
+      };
+
+      const ack = await deps.workbuddy.sendText(
+        text,
+        {
+          taskId,
+          pollIntervalMs: deps.config.workbuddy.pollIntervalMs,
+          sendConfirmTimeoutMs: deps.config.relay.sendConfirmTimeoutMs,
+        },
+        sendLifecycle,
+      );
 
       /*
-       * INPUT first, and only then anything else. The composer has to be read
-       * back and matched before a click can happen, so a mismatch here is the
-       * one send failure the task can walk away from - nothing was clicked.
+       * A fence that could not be written is not a send. The adapter refused to
+       * click, and this records why nothing was attempted - a plain refusal, so
+       * the task stays retryable and no click happened.
        */
-      await deps.noteStage({
-        taskId,
-        taskFingerprint: sendFingerprint,
-        dispatchId: sendId,
-        attempt: sendAttempt,
-        stage: ack.input.ok ? "INPUT_CONFIRMED" : "BLOCKED",
-        ledgerEvent: ack.input.ok ? "INPUT_CONFIRMED" : "INPUT_CONFIRM_FAILED",
-        detail: { ...ack.input, composer: ack.input.reason, clickAttempted: ack.clickOk },
-      });
+      if (ack.clickOutcome === "fence_refused") {
+        await deps.noteStage({
+          taskId,
+          taskFingerprint: sendFingerprint,
+          dispatchId: sendId,
+          attempt: sendAttempt,
+          stage: "BLOCKED",
+          ledgerEvent: "INPUT_CONFIRM_FAILED",
+          detail: { clickAttempted: false, ...ack.send.detail ? { detail: ack.send.detail } : {} },
+        });
 
+        throw new InputNotConfirmedError(
+          `the send attempt for ${taskId} was not durably fenced, so nothing was clicked; ` +
+            `it is safe to retry`,
+        );
+      }
+
+      /*
+       * The composer read-back is the gate, and it is checked here rather than
+       * trusted from the callback.
+       *
+       * A read-back that failed means the payload was never in the composer, and
+       * both the fence and the click sit *after* it - so nothing was attempted
+       * and nothing was sent. That is the one send failure a task walks away
+       * from, and the round is left exactly where it started: retryable.
+       */
       if (!ack.input.ok) {
+        await deps.noteStage({
+          taskId,
+          taskFingerprint: sendFingerprint,
+          dispatchId: sendId,
+          attempt: sendAttempt,
+          stage: "BLOCKED",
+          ledgerEvent: "INPUT_CONFIRM_FAILED",
+          detail: { ...ack.input, clickAttempted: false },
+        });
+
         throw new InputNotConfirmedError(
           `WorkBuddy composer did not hold the payload for ${taskId} (${ack.input.reason}); nothing was clicked`,
         );
@@ -658,6 +740,11 @@ export class DispatchPipeline {
        * carrying this task the world after the click is genuinely unknown, and
        * unknown is a reconciliation case - never an implicit success and never
        * a reason to send again.
+       *
+       * The fence is already on disk by this point, so this branch is reached
+       * with SEND_ATTEMPTED recorded: whatever happens next, the chain now says
+       * a send was attempted, which is what stops a later restart from reading
+       * this as a task that was never tried.
        */
       if (!ack.send.ok) {
         await deps.noteStage({
@@ -668,7 +755,7 @@ export class DispatchPipeline {
           stage: "RECONCILIATION_REQUIRED",
           ledgerEvent: "SEND_CONFIRM_FAILED",
           workbuddyMessageId: ack.send.observedMessageId,
-          detail: { ...ack.send },
+          detail: { ...ack.send, clickOutcome: ack.clickOutcome },
         });
         throw new UnconfirmedDispatchError(
           `the send of ${taskId} could not be confirmed (${ack.send.reason}); reconciliation required`,

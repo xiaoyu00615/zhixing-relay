@@ -1,6 +1,6 @@
 import { dispatchIdFor, identityFingerprints } from "./fingerprint.js";
 import { durableSourceProof } from "./source-proof.js";
-import { hasProvenSend, terminalStateFor } from "./terminal.js";
+import { hasProvenSend, hasUncertainSend, terminalStateFor } from "./terminal.js";
 import type { ReconciliationEvent } from "./types.js";
 
 /**
@@ -17,6 +17,7 @@ export type DispatchBlockedReason =
   | "identity_conflict"
   | "terminal_cancelled"
   | "terminal_closed"
+  | "send_attempted"
   | "already_completed"
   | "already_running"
   | "send_confirmed"
@@ -130,6 +131,31 @@ export function decideDispatch(
           `an operator decided it is never sent again`,
       };
     }
+  }
+
+  /*
+   * A send that was ATTEMPTED but never confirmed is the dangerous middle.
+   *
+   * `SEND_ATTEMPTED` is a fence, not proof: it says the relay was about to
+   * click when the record was written. It does not say whether the click
+   * landed, and it is deliberately written before the click precisely so that
+   * a crash during the click leaves this row behind. A task that reaches this
+   * row may therefore be sitting in WorkBuddy's composer right now.
+   *
+   * So the outcome is unknown, and unknown is answered by freezing. Crucially
+   * this is not "probably fine after a while" - nothing about elapsed time
+   * makes an unconfirmed click safer, and a row is never downgraded into a
+   * retry by waiting. A human decides, through the close or resolve path.
+   */
+  if (hasUncertainSend(history.map((item) => item.event))) {
+    return {
+      kind: "blocked",
+      reason: "send_attempted",
+      detail:
+        `task ${taskId} has a recorded send attempt that was never confirmed; ` +
+        `the click may have reached WorkBuddy, so sending it again could run it twice - ` +
+        `reconcile it against WorkBuddy instead`,
+    };
   }
 
   /*

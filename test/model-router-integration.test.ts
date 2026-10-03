@@ -50,6 +50,7 @@ function confirmedAck(outboundId: string): SendAck {
       detail: "a new turn carrying this task is on the page",
     },
     clickOk: true,
+    clickOutcome: "clicked" as const,
   };
 }
 
@@ -421,8 +422,20 @@ async function makeHarness(
      * The fake answers the three confirmations the same way the CDP adapter
      * does: input is read back, and a send only counts when the page grew a
      * NEW turn carrying this task. A click alone is never enough.
+     *
+     * It also drives the same two lifecycle seams the real adapter awaits, in
+     * the same order, so the stages this run writes are the stages production
+     * would write - a fake that skipped them would leave INPUT_CONFIRMED and
+     * the send fence unrecorded and quietly stop testing the crash windows.
      */
-    sendText: async (text: string, context: { taskId: string }) => {
+    sendText: async (
+      text: string,
+      context: { taskId: string },
+      lifecycle: {
+        onInputConfirmed?: (input: ReturnType<typeof confirmInputReadback>) => Promise<void>;
+        onBeforeClick?: (input: ReturnType<typeof confirmInputReadback>) => Promise<void>;
+      } = {},
+    ) => {
       record("workbuddy.sendText");
       sentToWorkBuddy.push(text);
       if (h.sendTextError) throw new Error(h.sendTextError);
@@ -445,6 +458,7 @@ async function makeHarness(
             detail: "the payload never reached the composer",
           },
           clickOk: false,
+          clickOutcome: "button_missing" as const,
         };
       }
 
@@ -452,6 +466,10 @@ async function makeHarness(
         inputText: text,
         turns,
       });
+
+      // The real adapter awaits these before it clicks.
+      await lifecycle.onInputConfirmed?.(input);
+      await lifecycle.onBeforeClick?.(input);
 
       const before = snapshot([{ signature: "turn-before", role: "user", containsTaskId: false }]);
 
@@ -478,6 +496,7 @@ async function makeHarness(
         input,
         send: confirmSend({ before, after, expectedTaskId: context.taskId }),
         clickOk: true,
+        clickOutcome: "clicked" as const,
       };
     },
     waitForRunning: async (): Promise<RunningConfirmation> => {

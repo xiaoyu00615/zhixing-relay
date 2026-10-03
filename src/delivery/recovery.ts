@@ -49,6 +49,12 @@ export type RecoveryPlan =
    * let the acknowledgement - or a thread observation - close the round.
    */
   | { kind: "wait_ack"; taskId: string }
+  /**
+   * A send was attempted and never confirmed. The click may have landed, so
+   * the task is frozen for a human: it is not re-sent, not re-waited, and not
+   * treated as never-tried.
+   */
+  | { kind: "reconcile_send_attempt"; taskId: string }
   /** Only the queue needs attention. */
   | { kind: "flush_queue" };
 
@@ -92,10 +98,17 @@ export function durableStageOf(task: RecoverableTask | null): string {
 /**
  * True once the record proves the payload reached the page.
  *
- * Before `SEND_CONFIRMED` nothing has been shown to WorkBuddy, so nothing can
+ * Before `SEND_CONFIRMED` nothing has been *shown* to WorkBuddy, so nothing can
  * have run: retrying is still honest. At and after `SEND_CONFIRMED` a message
- * exists, and the only correct action for an unknown outcome is to stop and
- * let a human decide - restarting the send would duplicate the task.
+ * exists, and the only correct action for an unknown outcome is to stop and let
+ * a human decide - restarting the send would duplicate the task.
+ *
+ * `SEND_ATTEMPTED` sits below `SEND_CONFIRMED` on purpose and is therefore NOT
+ * proof. It is the fence written just before the click: the record says a click
+ * was about to happen, which is a reason to freeze, not a reason to claim the
+ * message was delivered. This function answers "do we know it arrived?", and the
+ * honest answer past the fence is still "we do not know" - which is why the
+ * fence is read separately, as uncertainty, rather than here as proof.
  */
 export function sendIsProven(stage: string): boolean {
   const rank = isTaskExecutionStage(stage) ? stageRank(stage) : -1;
@@ -164,6 +177,22 @@ export function planRecovery(task: RecoverableTask | null): RecoveryPlan {
   }
 
   const outboundId = task.workbuddyOutboundMessageId;
+
+  /*
+   * 4. A recorded send attempt that was never confirmed.
+   *
+   * The fence says the click was about to happen. Whether it landed is not in
+   * the record, so there is nothing to wait for - no message id was ever
+   * observed - and nothing safe to do either. This is deliberately NOT a
+   * `resume_wait`: listening for a turn that may never arrive would leave the
+   * round open against a composer that may or may not have been submitted.
+   *
+   * It is also never downgraded by waiting. Time does not make an unconfirmed
+   * click safer, so the only exit is a human decision.
+   */
+  if (stage === "SEND_ATTEMPTED") {
+    return { kind: "reconcile_send_attempt", taskId: task.taskId };
+  }
 
   if (outboundId && RUNNING_STATUSES.has(task.status)) {
     return {

@@ -97,6 +97,7 @@ const PROVEN_SEND_EVIDENCE: readonly ReconciliationEventName[] = [
 const EXECUTION_EVIDENCE: readonly ReconciliationEventName[] = [
   "DISPATCH_STARTED",
   "INPUT_CONFIRMED",
+  "SEND_ATTEMPTED",
   "SEND_CONFIRMED",
   "RUNNING_CONFIRMED",
   "RESULT_RECEIVED",
@@ -109,6 +110,25 @@ const EXECUTION_EVIDENCE: readonly ReconciliationEventName[] = [
 /** Whether these events prove the task reached WorkBuddy at least once. */
 export function hasProvenSend(evidence: readonly ReconciliationEventName[]): boolean {
   return PROVEN_SEND_EVIDENCE.some((event) => evidence.includes(event));
+}
+
+/**
+ * Whether a send was attempted and never confirmed.
+ *
+ * The dangerous middle, and the reason it gets its own answer: the fence says a
+ * click was about to happen, nothing says whether it landed, so the task may be
+ * running right now. This is neither proof of arrival nor proof of absence, and
+ * it has to veto a retry on its own - a requeue row is an error record, not a
+ * licence to try again.
+ *
+ * It is deliberately *not* time-based: a fence stays uncertain however long ago
+ * it was written, because nothing about waiting makes an unconfirmed click
+ * safer.
+ */
+export function hasUncertainSend(evidence: readonly ReconciliationEventName[]): boolean {
+  return (
+    evidence.includes("SEND_ATTEMPTED") && !evidence.includes("SEND_CONFIRMED")
+  );
 }
 
 /**

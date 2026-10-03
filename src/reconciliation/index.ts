@@ -202,6 +202,7 @@ export class ReconciliationService {
     event: Extract<
       ReconciliationEventName,
       | "INPUT_CONFIRMED"
+      | "SEND_ATTEMPTED"
       | "SEND_CONFIRMED"
       | "RUNNING_CONFIRMED"
       | "RESULT_RECEIVED"

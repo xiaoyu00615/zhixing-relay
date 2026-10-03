@@ -74,6 +74,7 @@ function confirmedAck(outboundId: string): SendAck {
       detail: "a new turn carrying this task is on the page",
     },
     clickOk: true,
+    clickOutcome: "clicked" as const,
   };
 }
 

@@ -145,7 +145,14 @@ function buildWorkbuddy(share: FakeWorkbuddy, knobs: Knobs): {
       getCurrentModel: async () => null,
       selectModel: async () => ({ changed: false, previous: null, current: "Hy3" }),
       detectQuota: async () => ({ status: "available", modelLabel: "Hy3" }),
-      sendText: async (text: string, context: { taskId: string }) => {
+      sendText: async (
+        text: string,
+        context: { taskId: string },
+        lifecycle: {
+          onInputConfirmed?: (input: ReturnType<typeof confirmInputReadback>) => Promise<void>;
+          onBeforeClick?: (input: ReturnType<typeof confirmInputReadback>) => Promise<void>;
+        } = {},
+      ) => {
         state.sentToWorkBuddy.push(text);
 
         const input = confirmInputReadback({
@@ -166,8 +173,13 @@ function buildWorkbuddy(share: FakeWorkbuddy, knobs: Knobs): {
               detail: "the payload never reached the composer",
             },
             clickOk: false,
+            clickOutcome: "button_missing",
           };
         }
+
+        // The real adapter awaits these two seams before it clicks.
+        await lifecycle.onInputConfirmed?.(input);
+        await lifecycle.onBeforeClick?.(input);
 
         const snapshot = (turns: TurnSnapshot["turns"]): TurnSnapshot => ({
           inputText: text,
@@ -200,6 +212,7 @@ function buildWorkbuddy(share: FakeWorkbuddy, knobs: Knobs): {
           input,
           send: confirmSend({ before, after, expectedTaskId: context.taskId }),
           clickOk: true,
+          clickOutcome: "clicked",
         };
       },
       waitForRunning: async (): Promise<RunningConfirmation> => {
@@ -791,6 +804,10 @@ describe("running confirmation", () => {
       "TASK_ACCEPTED",
       "DISPATCH_STARTED",
       "INPUT_CONFIRMED",
+      // The send fence, durable before the click and visible in the chain even
+      // on a fully successful round: it is a record of the attempt, not a
+      // failure, and its absence would be the duplicate-send bug.
+      "SEND_ATTEMPTED",
       "SEND_CONFIRMED",
       "RUNNING_CONFIRMED",
       "RESULT_RECEIVED",

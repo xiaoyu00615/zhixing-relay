@@ -628,6 +628,51 @@ export class ZhixingRelay {
       return;
     }
 
+    if (plan.kind === "reconcile_send_attempt") {
+      /*
+       * A send was attempted and never confirmed, so the click may have landed.
+       *
+       * The honest move is to stop: the task is neither re-sent (that is the
+       * duplicate this fence exists to prevent) nor re-waited (no outbound turn
+       * was ever observed, so there is nothing to listen for). The record is
+       * moved to RECONCILIATION_REQUIRED, which both answers "why is this
+       * stuck" and freezes scheduling through the one hold the relay computes.
+       *
+       * A false positive here is the safe direction: the cost is a human
+       * decision, and the cost of the alternative is a task run twice.
+       */
+      await this.noteStage({
+        taskId: plan.taskId,
+        taskFingerprint: "*",
+        dispatchId: task?.dispatchId ?? null,
+        attempt: task?.attempt ?? null,
+        execution: task?.execution ?? null,
+        stage: "RECONCILIATION_REQUIRED",
+        ledgerEvent: "SEND_CONFIRM_FAILED",
+        detail: {
+          reason: "send_attempted_without_confirmation",
+          note:
+            "a send attempt was recorded before the click and no confirmation followed; " +
+            "the click may have reached WorkBuddy, so this must not be sent again",
+          via: "restart_recovery",
+        },
+      });
+
+      await this.audit.write("send_attempt_recovered", {
+        taskId: plan.taskId,
+        dispatchId: task?.dispatchId ?? null,
+        reason: "a recorded send attempt was never confirmed; frozen for a human decision",
+      });
+
+      console.error(
+        `[relay] task ${plan.taskId} has an unconfirmed send attempt; it is frozen for ` +
+          `reconciliation and will not be sent again`,
+      );
+
+      await this.runReconciliation(`send attempt unreconciled: ${plan.taskId}`);
+      return;
+    }
+
     this.scheduleWork(() => this.flushOnePending());
   }
 
