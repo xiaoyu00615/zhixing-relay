@@ -27,6 +27,7 @@ import {
   type TurnRole,
   type TurnSnapshot,
 } from "../src/workbuddy/turn-ack.js";
+import { turnTextSignature } from "../src/workbuddy/turn-roles.js";
 
 const SMOKE_TASK = "relay-production-smoke-v0473c-001";
 const PAYLOAD_PREFIX = "Production smoke test only.";
@@ -34,41 +35,67 @@ const PAYLOAD_PREFIX = "Production smoke test only.";
 /** The relay's own outbound bubble, as the page rendered it. */
 const USER_BUBBLE_TEXT = `${PAYLOAD_PREFIX}\n\nTASK_ID: ${SMOKE_TASK}`;
 
+/**
+ * The user-row identity, from the rule that ships rather than a copy of it.
+ *
+ * The assertion this feeds is deliberately doubled: the observed id has to be
+ * the message's fingerprint *and* has not to be the round's old
+ * `length|first64` rule. Only the second half turns red if the signature ever
+ * slides back to the whole node's text.
+ */
+const USER_BUBBLE_SIGNATURE = turnTextSignature(USER_BUBBLE_TEXT);
+/** What the assistant-side rows still identify as. */
+const roundSignatureOf = (text: string) => `${text.length}|${text.slice(0, 64)}`;
+
 /** The production status card, kept as the literal the page produced. */
 const PROCESSING_CARD_TEXT = "WorkBuddy ... 已处理 ... 思考中";
 
-function signatureOf(text: string): string {
-  // The page's own rule, mirrored so the test can name the node it expects.
-  return `${text.length}|${text.slice(0, 64)}`;
-}
-
-const PROCESSING_CARD_SIGNATURE = signatureOf(PROCESSING_CARD_TEXT);
-const USER_BUBBLE_SIGNATURE = signatureOf(USER_BUBBLE_TEXT);
+const PROCESSING_CARD_SIGNATURE = roundSignatureOf(PROCESSING_CARD_TEXT);
 
 type StubNode = {
   text: string;
   classes?: string[];
   /** Selectors this node answers to, i.e. which chrome it renders. */
   has?: string[];
+  /**
+   * Whether the page renders this node as a user-authored message row.
+   *
+   * `.cr-agent` and `.cr-self-message` are different node families on the real
+   * page, and the expression has to tell them apart through the class list.
+   */
+  userRow?: boolean;
 };
 
 /**
- * The smallest `document` the expression needs: one composer and a list of
- * `.cr-agent` nodes. Nothing else on the page exists as far as it is concerned.
+ * The smallest `document` the expression needs: one composer and the rendered
+ * rows - assistant rounds and user messages. Nothing else on the page exists
+ * as far as it is concerned.
+ *
+ * `userRow` is what the stub answers `classList.contains('cr-self-message')`
+ * with, so the node family the expression sees is the one the test chose.
  */
 function stubDocument(nodes: StubNode[], composer: string) {
   return {
     querySelector: (selector: string) =>
       selector.includes("contenteditable") ? { innerText: composer } : null,
     querySelectorAll: (selector: string) =>
-      selector === ".cr-agent"
-        ? nodes.map((node) => ({
-            innerText: node.text,
-            classList: { contains: (name: string) => (node.classes ?? []).includes(name) },
-            querySelector: (inner: string) =>
-              (node.has ?? []).includes(inner) ? { innerText: node.text } : null,
-            querySelectorAll: () => [],
-          }))
+      selector.includes(".cr-agent") || selector.includes(".cr-self-message")
+        ? nodes.map((node) => {
+            const classes = node.classes ?? [];
+            return {
+              innerText: node.text,
+              classList: {
+                contains: (name: string) =>
+                  node.userRow === true
+                    ? name === "cr-self-message" || classes.includes(name)
+                    : classes.includes(name),
+              },
+              matches: () => false,
+              querySelector: (inner: string) =>
+                (node.has ?? []).includes(inner) ? { innerText: node.text } : null,
+              querySelectorAll: () => [],
+            };
+          })
         : [],
   };
 }
@@ -122,9 +149,14 @@ const PROCESSING_CARD: StubNode = {
 const USER_BUBBLE: StubNode = {
   text: USER_BUBBLE_TEXT,
   has: [".cr-self-message__content"],
+  userRow: true,
 };
 
-const OLD_USER_TURN: StubNode = { text: "an older request", has: [".cr-self-message__content"] };
+const OLD_USER_TURN: StubNode = {
+  text: "an older request",
+  has: [".cr-self-message__content"],
+  userRow: true,
+};
 
 const OLD_ANSWER: StubNode = { text: "已完成 12s", has: [".conversation-finished-footer"] };
 
@@ -318,6 +350,8 @@ describe("the whole chain, in the production order", () => {
     expect(confirmation.ok).toBe(true);
     // The proof is the outbound bubble, never the status card.
     expect(confirmation.observedMessageId).toBe(USER_BUBBLE_SIGNATURE);
+    // ...and it is the message's own identity, not the round's old rule.
+    expect(confirmation.observedMessageId).not.toBe(roundSignatureOf(USER_BUBBLE_TEXT));
     expect(confirmation.observedMessageId).not.toBe(PROCESSING_CARD_SIGNATURE);
     expect(confirmation.ignoredRoles).toContain("assistant");
   });

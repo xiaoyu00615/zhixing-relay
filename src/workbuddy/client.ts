@@ -12,7 +12,7 @@ import {
   type WorkBuddyTurnSignals,
 } from "./turn-state.js";
 import { type ObservedTurn, type TurnRole, type TurnSnapshot } from "./turn-ack.js";
-import { CLASSIFY_TURN_NODE_SOURCE } from "./turn-roles.js";
+import { CLASSIFY_TURN_NODE_SOURCE, TURN_TEXT_FACTS_SOURCE } from "./turn-roles.js";
 
 export type { WorkBuddyState } from "./turn-state.js";
 export type { QuotaDetection, QuotaSignals } from "./quota.js";
@@ -113,11 +113,27 @@ function asString(value: unknown): string {
  * Selectors that matter:
  *
  *   [contenteditable="true"][role="textbox"]  the composer
- *   .cr-agent                                 one rendered turn/message
+ *   .cr-agent                                 one rendered assistant round
+ *   .cr-self-message                          one user-authored message
  *
- * A turn signature is the rendered length plus the first characters of the
- * turn's own text: enough to tell "the same turn as before the click" from "a
- * new one", and it never carries the whole body out of the page.
+ * THE USER ROW, NOT THE ROUND, IS THE SEND PROOF.
+ *
+ * Measured on the live page (CDP, three rows + the opened composer): a
+ * `.cr-agent` is WorkBuddy's side only - its header says "WorkBuddy", its body
+ * is the answer, and the status chrome (`cr-agent__processing-status`,
+ * `conversation-finished-footer`, `cr-collapse--completed`) rides along with
+ * it. The text the relay typed lives in a `.cr-self-message` sibling, under
+ * `.cr-frame--right`, and the document virtualiser can render that bubble more
+ * than once with a different `data-user-message-id` each time.
+ *
+ * So collecting only `.cr-agent` made a fresh user turn invisible, and every
+ * send was scored `no_new_turn` even when the message was on screen, executed
+ * and answered. Both node families are collected now, in page order, and each
+ * family carries the identity of the text that actually belongs to it.
+ *
+ * A turn signature for a user row is the fingerprint of the *message*, never
+ * the text of the round around it: the assistant side keeps growing and
+ * changing state, and a signature that moves with it describes nothing stable.
  *
  * THE SET, NOT JUST THE PREDICATE, IS THE FIX.
  *
@@ -156,15 +172,49 @@ export const TURN_SNAPSHOT_EXPRESSION = (request: {
 }) => `
   (() => {
     ${CLASSIFY_TURN_NODE_SOURCE}
+    ${TURN_TEXT_FACTS_SOURCE}
     const input = document.querySelector('[contenteditable="true"][role="textbox"]');
-    const nodes = Array.from(document.querySelectorAll('.cr-agent'));
     const taskId = ${JSON.stringify(request.taskId)};
     const payloadPrefix = ${JSON.stringify(request.payloadPrefix)};
 
-    const observed = nodes.map((el, index) => {
-      const text = String(el.innerText || '');
-      const signature = text.length + '|' + text.slice(0, 64);
-      const collapsed = text.replace(/\\s+/g, ' ').trim();
+    // One row per rendered turn. The selector walks the document, so the rows
+    // come back in page order without sorting.
+    const nodes = Array.from(
+      document.querySelectorAll('.cr-agent, .cr-self-message')
+    ).filter(function (el) {
+      // A user bubble rendered inside an assistant round is that round's own
+      // echo of the prompt, not a turn of its own going out.
+      return !el.matches('.cr-agent .cr-self-message');
+    });
+
+    const seen = {};
+    const observed = [];
+
+    for (var n = 0; n < nodes.length; n++) {
+      const el = nodes[n];
+      const isUserRow = el.classList.contains('cr-self-message');
+      // The user row's own message, never the round around it.
+      const messageEl = el.querySelector('.cr-self-message__content') ||
+        el.querySelector('.cr-user-content');
+      const messageText = isUserRow && messageEl
+        ? String(messageEl.innerText || '')
+        : '';
+      const roundText = String(el.innerText || '');
+      const collapsed = roundText.replace(/\\s+/g, ' ').trim();
+
+      // A user row identifies as its message; a round identifies as the text
+      // it renders, because that is what its chrome travels with.
+      const signature = isUserRow
+        ? turnTextSignature(messageText)
+        : roundText.length + '|' + roundText.slice(0, 64);
+      const containsTaskId = isUserRow
+        ? turnTextContainsTaskId(messageText, taskId)
+        : turnTextContainsTaskId(roundText, taskId);
+
+      // The virtualiser renders the same message more than once. One row per
+      // message: an identity that names the same message twice is not new.
+      if (seen[signature]) continue;
+      seen[signature] = true;
 
       const userContent = el.querySelector('.cr-self-message__content');
       const processingStatus = el.querySelector('.cr-agent__processing-status');
@@ -190,15 +240,15 @@ export const TURN_SNAPSHOT_EXPRESSION = (request: {
         carriesPayload: collapsed.indexOf(payloadPrefix) !== -1,
       });
 
-      return {
+      observed.push({
         signature: signature,
         role: role,
         // Identity, kept on every node: whichever of them the verdict layer
         // listens to still has to prove which task it carries.
-        containsTaskId: text.indexOf(taskId) !== -1,
-        index: index,
-      };
-    });
+        containsTaskId: containsTaskId,
+        index: n,
+      });
+    }
 
     return JSON.stringify({
       inputText: String(input ? (input.innerText || '') : ''),
