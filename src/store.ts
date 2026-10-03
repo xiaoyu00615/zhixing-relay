@@ -115,6 +115,24 @@ export class RelayStore {
     });
   }
 
+  /**
+   * Puts a popped queue item back, exactly as it was.
+   *
+   * The other half of `shiftPending`. A caller takes an item out to decide
+   * about it, and a decision that sends nothing must not cost the task: the
+   * entry goes back with its own id, text, fingerprints and retry count, or
+   * the task would quietly change identity while nobody was looking.
+   *
+   * Idempotent by id, because the caller may be recovering from a refusal it
+   * is not sure landed.
+   */
+  async restorePending(item: PendingItem): Promise<void> {
+    await this.mutate((state) => {
+      if (state.pending.some((existing) => existing.id === item.id)) return;
+      state.pending.unshift(item);
+    });
+  }
+
   async shiftPending(): Promise<PendingItem | null> {
     let item: PendingItem | null = null;
 

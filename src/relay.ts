@@ -2,6 +2,7 @@ import type { AppConfig } from "./config.js";
 import { AuditLog } from "./audit.js";
 import { BridgeServer } from "./bridge-server.js";
 import {
+  ensureTaskId,
   parseRelayEnvelope,
   readRelayIntent,
   wrapWorkBuddyResult,
@@ -1000,7 +1001,16 @@ export class ZhixingRelay {
       return;
     }
 
-    await this.dispatch.startTask(task, message.fingerprint);
+    /*
+     * The message arrived from the pinned ChatGPT page a moment ago, so it is
+     * the live proof of itself: assistant source, envelope, task id, message
+     * fingerprint. Naming that here is what lets the first acceptance write a
+     * durable attestation, which is the only reason a later retry can run
+     * after the page has unmounted the bubble.
+     */
+    await this.dispatch.startTask(task, message.fingerprint, {
+      observedOnGptPage: true,
+    });
   }
 
   /** A machine-readable reason for a reply that carried nothing to do. */
@@ -1646,6 +1656,8 @@ export class ZhixingRelay {
     taskId: string;
     fingerprint: string;
     messageFingerprint: string;
+    /** True only when the task was handed in straight from the GPT page. */
+    observedOnGptPage: boolean;
   }): Promise<{ dispatchId: string; attempt: number } | null> {
     if (!this.reconciliation) {
       // No ledger configured: the old behaviour, and no invented decision.
@@ -1675,7 +1687,18 @@ export class ZhixingRelay {
     const decision = decideDispatch(history, {
       taskId: args.taskId,
       taskFingerprint: args.fingerprint,
-      gptEvidence: await this.gptEvidenceFor(args.taskId, args.fingerprint),
+      sourceFingerprint: args.messageFingerprint,
+      /*
+       * A task handed in by the page it was just read from needs no second
+       * reading. A task taken off the queue does: nothing else says where it
+       * came from, so the page is asked - and, when the page has let go of the
+       * message, the chain written when it was first accepted is asked
+       * instead. Both are the same question, asked at two different moments.
+       */
+      gptEvidence: args.observedOnGptPage
+        ? { taskId: args.taskId, taskFingerprint: args.fingerprint }
+        : await this.gptEvidenceFor(args.taskId, args.fingerprint),
+      observedOnGptPage: args.observedOnGptPage,
       maxAttempts: this.maxTaskRetries(),
     });
 
@@ -2307,7 +2330,23 @@ export class ZhixingRelay {
     if (!item) return;
 
     if (item.kind === "gpt_task") {
-      await this.dispatch.startTask(item.text, item.fingerprint);
+      /*
+       * The item left the queue above, so from here until the round owns it,
+       * this call stack is the only thing holding the task. A refusal that
+       * happens before WorkBuddy has seen anything must give it straight
+       * back - the same entry, not a copy of it - because "nothing was sent"
+       * only means "safe to keep", never "safe to drop".
+       *
+       * A queued outcome is different on purpose: the pipeline already wrote
+       * its own entry, so adding the original back would put the task on the
+       * queue twice.
+       */
+      const outcome = await this.dispatch.startTask(item.text, item.fingerprint);
+
+      if (outcome.kind === "pre_send_rejected") {
+        await this.retainPendingTask(item, outcome.reason);
+      }
+
       return;
     }
 
@@ -2330,5 +2369,56 @@ export class ZhixingRelay {
         await this.store.enqueue(item);
       }
     }
+  }
+
+  /**
+   * Gives a queue entry back to the queue, unchanged.
+   *
+   * This is the other half of `shiftPending`, and the half that used to be
+   * missing: taking a task off the queue to decide about it is only safe while
+   * every refusal puts it back. Nothing here retries, re-schedules or counts
+   * an attempt - a task refused for want of proof has not been attempted, and
+   * counting it would burn the retry budget on a question nobody answered.
+   *
+   * So the entry keeps its id, its text, its fingerprints, its taskId and its
+   * retryCount, and the ledger is told where it is: a task in the queue is
+   * readable as "queued, not sent", which is the one thing a startup
+   * reconciliation must not mistake for a lost task.
+   */
+  private async retainPendingTask(item: PendingItem, reason: string): Promise<void> {
+    await this.store.restorePending(item);
+
+    const text = item.kind === "gpt_task" ? item.text : "";
+    const taskId = ensureTaskId(text, makeId("task"));
+
+    if (this.reconciliation && item.kind === "gpt_task") {
+      await this.reconciliation.recordTaskEnqueued({
+        taskId,
+        taskFingerprint: taskFingerprint(text),
+        dispatchId: item.dispatchId ?? null,
+        attempt: item.attempt ?? null,
+        source: "relay",
+        detail: { reason, via: "pre_send_rejection" },
+      });
+      this.noteLedgerWrite();
+    }
+
+    await this.audit.write("task_retained", {
+      taskId,
+      reason,
+      pendingId: item.id,
+    });
+
+    console.error(
+      `[relay] task ${taskId} retained on the queue (${reason}): nothing was sent, ` +
+        `nothing owns it but the queue, and no retry was counted`,
+    );
+
+    /*
+     * Deliberately no `flushOnePending()` here. Re-flushing would make the
+     * rejection schedule its own retry, and a task whose proof never arrives
+     * would spin - one blocked event per tick, for ever. The next dispatch
+     * needs a real trigger: a resume, a reconnect, or the next round ending.
+     */
   }
 }

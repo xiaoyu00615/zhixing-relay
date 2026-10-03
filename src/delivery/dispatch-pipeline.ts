@@ -51,6 +51,26 @@ export class InputNotConfirmedError extends Error {}
 export class UnconfirmedDispatchError extends Error {}
 
 /**
+ * Who owns the task once `startTask` has returned.
+ *
+ * The caller - the queue flush - took the task off `pending` before calling
+ * in, so it has to be told whether it may let go of it. "Nothing was sent" and
+ * "the task is nowhere" were the same answer for one release too long: a
+ * refusal used to fall out of `startTask` leaving an item that had already
+ * been shifted off the queue and never written anywhere else.
+ */
+export type StartTaskOutcome =
+  /** The round took it: it is `currentTask`, or frozen for a human decision. */
+  | { kind: "dispatched" }
+  /** The pipeline put its own copy of the task back on the queue. */
+  | { kind: "queued"; reason: string }
+  /**
+   * Nothing reached WorkBuddy and nothing owns the task: the caller must put
+   * the queue entry back exactly as it was.
+   */
+  | { kind: "pre_send_rejected"; reason: string };
+
+/**
  * A durable move of one dispatch through its execution stage.
  *
  * Everything below is a coordination fact, not a policy: the pipeline asks the
@@ -90,6 +110,8 @@ export interface DispatchPipelineDeps {
     taskId: string;
     fingerprint: string;
     messageFingerprint: string;
+    /** The task came straight from the GPT page, so the page is the proof. */
+    observedOnGptPage: boolean;
   }) => Promise<{ dispatchId: string; attempt: number } | null>;
   noteStage: (args: StageNote) => Promise<void>;
   /** The one place a WorkBuddy answer becomes a RESULT to ChatGPT. */
@@ -133,8 +155,16 @@ export class DispatchPipeline {
    * The whole round - routing, sending, waiting - is a single sequence here so
    * that no path between "no model" and "WorkBuddy answered" can slip a
    * requeue in.
+   *
+   * The returned outcome is not a status report, it is an ownership handover:
+   * every path that refuses to send before WorkBuddy has seen anything says so
+   * explicitly, so the caller can keep holding a task nothing else took.
    */
-  async startTask(text: string, sourceFingerprint: string): Promise<void> {
+  async startTask(
+    text: string,
+    sourceFingerprint: string,
+    options: { observedOnGptPage?: boolean } = {},
+  ): Promise<StartTaskOutcome> {
     const { store, audit, router } = this.deps;
 
     this.deps.noteActivity();
@@ -160,7 +190,7 @@ export class DispatchPipeline {
         fingerprint: sourceFingerprint,
         createdAt: isoNow(),
       });
-      return;
+      return { kind: "queued", reason: "relay_paused" };
     }
 
     /*
@@ -173,8 +203,15 @@ export class DispatchPipeline {
       taskId,
       fingerprint,
       messageFingerprint: sourceFingerprint,
+      observedOnGptPage: options.observedOnGptPage === true,
     });
-    if (!plan) return;
+
+    /*
+     * Refused before a single character reached WorkBuddy. The task is
+     * provably unsent and - this is the part that used to be lost - provably
+     * unowned, so the caller has to put it back.
+     */
+    if (!plan) return { kind: "pre_send_rejected", reason: "dispatch_not_allowed" };
 
     /*
      * Accepted for a turn. Written before anything else can decide against
@@ -221,7 +258,8 @@ export class DispatchPipeline {
           reasons: [],
           error: error instanceof Error ? error.message : String(error),
         });
-        return;
+        // The pipeline queued its own copy, so the caller must not add one.
+        return { kind: "queued", reason: "no_available_model" };
       }
 
       if (selection.kind === "no_available_model") {
@@ -230,7 +268,7 @@ export class DispatchPipeline {
           nextResetAt: selection.nextResetAt,
           reasons: selection.reasons,
         });
-        return;
+        return { kind: "queued", reason: "no_available_model" };
       }
 
       routed = { id: selection.model.id, label: selection.model.label };
@@ -295,6 +333,9 @@ export class DispatchPipeline {
       });
 
       await this.deps.onWorkBuddyResult(taskId, outcome.lastMessageId, outcome.body);
+
+      // The round ran to its answer: the record - or its completion - owns it.
+      return { kind: "dispatched" };
     } catch (error) {
       this.deps.setWorkAbort(null);
       const detail = error instanceof Error ? error.message : String(error);
@@ -340,7 +381,8 @@ export class DispatchPipeline {
         );
 
         await this.deps.reconcile(`frozen dispatch of ${taskId}`);
-        return;
+        // The task record stays, carrying the evidence of what happened.
+        return { kind: "dispatched" };
       }
 
       /*
@@ -413,6 +455,13 @@ export class DispatchPipeline {
        */
       router?.releasePin();
     }
+
+    /*
+     * Every other exit - a completed round, a round that went back to the
+     * queue, one frozen for a human - left the task somewhere. Nothing below
+     * this point may hand a task back to the caller.
+     */
+    return { kind: "dispatched" };
   }
 
   /**

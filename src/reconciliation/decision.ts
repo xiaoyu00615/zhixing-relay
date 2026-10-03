@@ -1,4 +1,5 @@
 import { dispatchIdFor, identityFingerprints } from "./fingerprint.js";
+import { durableSourceProof } from "./source-proof.js";
 import type { ReconciliationEvent } from "./types.js";
 
 /**
@@ -30,11 +31,24 @@ export type DispatchRequest = {
   taskId: string;
   taskFingerprint: string;
   /**
-   * The task as it was last seen on the GPT page. A resend is only ever
-   * allowed when the page still carries the very same envelope; if it does
-   * not, the relay has no way to know what was actually published.
+   * Fingerprint of the GPT message this task is being attributed to. Required:
+   * it is half of the durable source attestation, and a request that left it
+   * out would silently read as "unproven" - a refusal nobody asked for.
+   */
+  sourceFingerprint: string;
+  /**
+   * The task as it was last seen on the GPT page, re-read just now. Null when
+   * the page is not carrying the envelope any more - which is what happens as
+   * soon as ChatGPT unmounts an older message, so on its own it is not
+   * evidence of anything.
    */
   gptEvidence: { taskId: string; taskFingerprint: string } | null;
+  /**
+   * The task is being handed over straight from a message the GPT page just
+   * produced, so the page does not have to be asked to repeat itself. Only the
+   * live intake path carries this; a queue flush never does.
+   */
+  observedOnGptPage?: boolean;
   maxAttempts: number;
   now?: Date;
 };
@@ -107,9 +121,36 @@ export function decideDispatch(
   }
 
   /*
+   * Every dispatch from here on needs the task's provenance to be proven
+   * somehow - by the page, right now, or by the chain the relay wrote when it
+   * first accepted it. The two are the same claim from different moments, and
+   * both are read before anything is sent.
+   */
+  const observed =
+    request.observedOnGptPage === true ||
+    (request.gptEvidence !== null &&
+      request.gptEvidence.taskId === taskId &&
+      request.gptEvidence.taskFingerprint === request.taskFingerprint);
+
+  const proof = durableSourceProof(history, {
+    taskId,
+    taskFingerprint: request.taskFingerprint,
+    sourceFingerprint: request.sourceFingerprint,
+  });
+
+  if (!observed && proof.kind !== "attested") {
+    return {
+      kind: "blocked",
+      reason: "gpt_not_found",
+      detail:
+        `task ${taskId} is not on the GPT page with the same envelope and no accepted ` +
+        `chain attests to it (${proof.reason}), so there is no proof of what was published`,
+    };
+  }
+
+  /*
    * A dispatch that exists but was never confirmed either way is the only
-   * case where a retry can be justified - and only with the GPT page still
-   * carrying the identical envelope.
+   * case where a retry can be justified.
    */
   const dispatched = has(history, "DISPATCH_STARTED") || has(history, "INPUT_CONFIRMED");
 
@@ -124,26 +165,14 @@ export function decideDispatch(
       };
     }
 
-    const matches =
-      request.gptEvidence !== null &&
-      request.gptEvidence.taskId === taskId &&
-      request.gptEvidence.taskFingerprint === request.taskFingerprint;
-
-    if (!matches) {
-      return {
-        kind: "blocked",
-        reason: "gpt_not_found",
-        detail:
-          `task ${taskId} is not on the GPT page with the same envelope, so there is no ` +
-          `proof of what was published`,
-      };
-    }
-
     return {
       kind: "resend_allowed",
       dispatchId: dispatchIdFor(taskId, attempt),
       attempt,
-      reason: "no execution evidence and the same envelope is still published",
+      reason: observed
+        ? "no execution evidence and the same envelope is still published"
+        : `no execution evidence and the accepted chain still attests to this envelope ` +
+          `(seq ${proof.kind === "attested" ? proof.attestation.seq : "unknown"})`,
     };
   }
 
@@ -151,6 +180,9 @@ export function decideDispatch(
     kind: "dispatched",
     dispatchId: dispatchIdFor(taskId, 0),
     attempt: 0,
-    reason: "first dispatch of a published task",
+    reason: observed
+      ? "first dispatch of a published task"
+      : `first dispatch of a task the accepted chain attests to ` +
+        `(seq ${proof.kind === "attested" ? proof.attestation.seq : "unknown"})`,
   };
 }

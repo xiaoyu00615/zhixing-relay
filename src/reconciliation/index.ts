@@ -18,6 +18,7 @@ export * from "./fingerprint.js";
 export * from "./reconcile.js";
 export type * from "./decision.js";
 export { decideDispatch } from "./decision.js";
+export * from "./source-proof.js";
 export * from "./types.js";
 
 /**
@@ -56,6 +57,22 @@ export class ReconciliationService {
     const prior = identityFingerprints(history.map((event) => event.taskFingerprint));
     const conflict = prior.find((fingerprint) => fingerprint !== input.taskFingerprint);
 
+    /*
+     * One published row per task envelope.
+     *
+     * Publishing used to append on every attempt, so a retry that was refused
+     * a moment later still left a "the relay saw this task" row behind - a row
+     * that reads as provenance and is really only the trace of a refusal. One
+     * row per envelope is what the event means: the task exists and is known.
+     * Everything an attempt does after that is told by the events it writes.
+     */
+    const alreadyPublished = history.some(
+      (event) =>
+        event.event === "TASK_PUBLISHED" &&
+        event.taskId === input.taskId &&
+        event.taskFingerprint === input.taskFingerprint,
+    );
+
     if (conflict) {
       await this.ledger.appendMany([
         {
@@ -87,14 +104,16 @@ export class ReconciliationService {
       return { status: "blocked", taskId: input.taskId, fingerprint: input.taskFingerprint };
     }
 
-    await this.ledger.append({
-      event: "TASK_PUBLISHED",
-      taskId: input.taskId,
-      taskFingerprint: input.taskFingerprint,
-      source,
-      messageFingerprint: input.messageFingerprint ?? null,
-      detail: input.detail ?? null,
-    });
+    if (!alreadyPublished) {
+      await this.ledger.append({
+        event: "TASK_PUBLISHED",
+        taskId: input.taskId,
+        taskFingerprint: input.taskFingerprint,
+        source,
+        messageFingerprint: input.messageFingerprint ?? null,
+        detail: input.detail ?? null,
+      });
+    }
 
     return { status: "ok", taskId: input.taskId, fingerprint: input.taskFingerprint };
   }

@@ -147,13 +147,18 @@ describe("ledger", () => {
 });
 
 describe("resend decision", () => {
-  const req = { maxAttempts: 3 } as const;
+  /*
+   * "m1" is the message fingerprint the healthy chain was accepted under, so
+   * a request carrying it is one the durable attestation can answer for.
+   */
+  const req = { maxAttempts: 3, sourceFingerprint: "m1" } as const;
 
-  it("sends a fresh task", () => {
+  it("sends a fresh task straight from the GPT page", () => {
     const decision = decideDispatch([], {
       taskId: "t-1",
       taskFingerprint: "fp",
       gptEvidence: null,
+      observedOnGptPage: true,
       ...req,
     });
 
@@ -177,12 +182,15 @@ describe("resend decision", () => {
     expect(decision.attempt).toBe(1);
   });
 
-  it("refuses the retry when the GPT page no longer carries that envelope", () => {
+  it("refuses the retry when the page carries a different envelope and no chain attests to this one", () => {
+    // The page shows another envelope, and the accepted chain was written for
+    // a different GPT message ("other" is not "m1"), so nothing proves it.
     const decision = decideDispatch(healthyChain("t-1", "fp"), {
       taskId: "t-1",
       taskFingerprint: "fp",
       gptEvidence: { taskId: "t-1", taskFingerprint: "other" },
-      ...req,
+      sourceFingerprint: "m-other",
+      maxAttempts: 3,
     });
 
     expect(decision).toEqual({
@@ -190,6 +198,92 @@ describe("resend decision", () => {
       reason: "gpt_not_found",
       detail: expect.stringContaining("no proof of what was published"),
     });
+  });
+
+  /*
+   * The production accident this replaces: a task the relay had already
+   * accepted went back to the queue, and by the time it was retried ChatGPT
+   * had unmounted the message. The page could not prove it any more, so a task
+   * that had never reached WorkBuddy was refused for ever - and dropped.
+   *
+   * The accepted chain is the proof the relay wrote when the page could still
+   * be read, so a retry may continue without it.
+   */
+  it("lets a retry continue on the accepted chain when the page let go of the message", () => {
+    const decision = decideDispatch(healthyChain("t-1", "fp"), {
+      taskId: "t-1",
+      taskFingerprint: "fp",
+      gptEvidence: null,
+      ...req,
+    });
+
+    expect(decision.kind).toBe("resend_allowed");
+    if (decision.kind !== "resend_allowed") return;
+    expect(decision.dispatchId).toBe("t-1#1");
+    expect(decision.attempt).toBe(1);
+    expect(decision.reason).toContain("accepted chain");
+  });
+
+  it("refuses the retry when the envelope was accepted under another task fingerprint", () => {
+    const decision = decideDispatch(healthyChain("t-1", "fp"), {
+      taskId: "t-1",
+      taskFingerprint: "fp-changed",
+      gptEvidence: null,
+      ...req,
+    });
+
+    expect(decision.kind === "blocked" && decision.reason).toBe("gpt_not_found");
+    if (decision.kind !== "blocked") return;
+    expect(decision.detail).toContain("task_fingerprint_mismatch");
+  });
+
+  it("refuses the retry when it was accepted under another GPT message", () => {
+    const decision = decideDispatch(healthyChain("t-1", "fp"), {
+      taskId: "t-1",
+      taskFingerprint: "fp",
+      gptEvidence: null,
+      sourceFingerprint: "m2",
+      maxAttempts: 3,
+    });
+
+    expect(decision.kind === "blocked" && decision.reason).toBe("gpt_not_found");
+    if (decision.kind !== "blocked") return;
+    expect(decision.detail).toContain("source_fingerprint_mismatch");
+  });
+
+  /*
+   * A refused attempt leaves TASK_PUBLISHED behind - publishing is written
+   * before the decision - so "published" can never be the proof that lets the
+   * next attempt through. Only an acceptance can.
+   */
+  it("never accepts a published-but-never-accepted chain as proof", () => {
+    const publishedOnly = healthyChain("t-1", "fp").filter(
+      (event) => event.event !== "TASK_ACCEPTED",
+    );
+
+    const decision = decideDispatch(publishedOnly, {
+      taskId: "t-1",
+      taskFingerprint: "fp",
+      gptEvidence: null,
+      ...req,
+    });
+
+    expect(decision.kind === "blocked" && decision.reason).toBe("gpt_not_found");
+    if (decision.kind !== "blocked") return;
+    expect(decision.detail).toContain("no_accepted_chain");
+  });
+
+  it("refuses a first-ever queue flush when nothing proves where the task came from", () => {
+    // No history at all and no page: an entry that cannot say where it came
+    // from is not allowed to become a WorkBuddy turn.
+    const decision = decideDispatch([], {
+      taskId: "t-1",
+      taskFingerprint: "fp",
+      gptEvidence: null,
+      ...req,
+    });
+
+    expect(decision.kind === "blocked" && decision.reason).toBe("gpt_not_found");
   });
 
   it("refuses to send a task that already produced a result", () => {
@@ -234,6 +328,7 @@ describe("resend decision", () => {
       taskId: "t-1",
       taskFingerprint: "fp",
       gptEvidence: { taskId: "t-1", taskFingerprint: "fp" },
+      sourceFingerprint: "m1",
       maxAttempts: 3,
     });
 
@@ -249,6 +344,7 @@ describe("resend decision", () => {
       taskId: "t-1",
       taskFingerprint: "fp",
       gptEvidence: { taskId: "t-1", taskFingerprint: "fp" },
+      sourceFingerprint: "m1",
       maxAttempts: 2,
     });
 
@@ -517,6 +613,7 @@ describe("the incident ledger", () => {
       taskId: INCIDENT_TASK,
       taskFingerprint: INCIDENT_HASH,
       gptEvidence: null,
+      sourceFingerprint: "m1",
       maxAttempts: 3,
     })).toMatchObject({ kind: "blocked", reason: "send_confirmed" });
   });
@@ -643,6 +740,7 @@ describe("a contradiction that is real", () => {
       taskId: INCIDENT_TASK,
       taskFingerprint: "0".repeat(64),
       gptEvidence: null,
+      sourceFingerprint: "m1",
       maxAttempts: 3,
     })).toMatchObject({ kind: "blocked", reason: "identity_conflict" });
   });
