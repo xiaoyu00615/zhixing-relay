@@ -48,6 +48,13 @@
  * therefore failed a switch that was perfectly safe, so the duplicate is now
  * tolerated under the rules in `findModelOption`: never by picking the first
  * match, and only when the rows are provably the same thing.
+ *
+ * "Provably" has to hold at click time too, not just at read time. The menu is
+ * live, so `CLICK_MODEL_OPTION_EXPRESSION` re-measures the row it was told to
+ * click - name, identity, and usability - and clicks nothing at all if any of
+ * them drifted. A click that lands on a row which changed underneath the
+ * resolution is worse than no click: it runs the task on an unknown model
+ * while the router believes it chose one.
  */
 
 export type WorkBuddyModelErrorCode =
@@ -75,27 +82,34 @@ export class WorkBuddyModelError extends Error {
 }
 
 /**
- * Attributes the page could use to say which model a row *is*, as opposed to
- * what it is called.
+ * Attributes that really say which model a row *is*, as opposed to what it is
+ * called. Strong identity, and the only thing a merge is ever based on.
  *
  * None of them is present today - the measured Hy3 rows carry only `class`,
  * `role`, `aria-selected` and `aria-disabled` - so `identity` is null on the
  * live page and the resolution falls through to the visibility rules. The list
  * is read anyway, in this order, so that a UI that starts identifying its rows
- * is understood without another production incident. It deliberately excludes
- * `id`: React hands those out per render, so two renders of one model would
- * look like two models.
+ * is understood without another production incident.
+ *
+ * The identity string keeps the attribute it came from (`data-model-id=hy3`,
+ * `data-model-key=hy3`) rather than the bare value. Two rows sharing a value
+ * across two different attributes share no proven source, and merging them
+ * would be a guess dressed up as a fact.
+ *
+ * `id` is excluded on purpose: React hands those out per render, so two renders
+ * of one model would look like two models. `data-testid`, `value` and `href`
+ * are excluded for the mirror reason - nothing on the page proves they track
+ * the model rather than the test harness, the form value, or the navigation
+ * target, so a match on them is not evidence. A row carrying only those is
+ * read as unidentified, which refuses a merge instead of risking one.
  */
-export const IDENTITY_ATTRIBUTE_NAMES = [
+export const STRONG_IDENTITY_ATTRIBUTE_NAMES = [
   "data-model-id",
   "data-model",
   "data-model-key",
   "data-id",
   "data-key",
   "data-value",
-  "data-testid",
-  "value",
-  "href",
 ] as const;
 
 export type ModelOption = {
@@ -104,7 +118,10 @@ export type ModelOption = {
   name: string;
   selected: boolean;
   disabled: boolean;
-  /** Stable identity of the model behind the row, or null when the page hides it. */
+  /**
+   * Stable identity of the model behind the row, or null when the page hides
+   * it. Encoded with its source (`data-model-id=hy3`), never as a bare value.
+   */
   identity: string | null;
   /** The row is rendered at all: not display:none, not visibility:hidden, has a box. */
   rendered: boolean;
@@ -124,6 +141,22 @@ export type ModelSwitchResult = {
   previous: string | null;
   current: string;
 };
+
+/**
+ * What made a row the answer.
+ *
+ * It is recorded because the click has to re-check the facts the choice rested
+ * on, and only those. Re-checking a fact that never decided anything would
+ * refuse clicks that production has always made - a label that appears once
+ * below the fold was, and stays, clickable.
+ */
+export type ModelChoiceBasis =
+  /** Exactly one row carries the label: the name alone was the answer. */
+  | "unique_name"
+  /** Several rows, and only one of them was on screen and clickable. */
+  | "usable_row"
+  /** Several rows, all carrying the same identity: one model, rendered twice. */
+  | "merged_identity";
 
 /** Why a label that matched more than one row could not be trusted. */
 export type ModelAmbiguityReason =
@@ -159,6 +192,13 @@ export function isUsableModelRow(option: ModelOption): boolean {
  *   identities present and different                      -> refuse
  *   nothing usable, or several usable and indistinguishable -> refuse
  *
+ * "Provably the same model" is the whole of it, and it is not a licence to
+ * click blindly: even when every duplicate row carries the same identity, the
+ * row that gets clicked still has to be usable. Two rows that are the same
+ * model but are both off screen are not clickable evidence of anything, and
+ * falling back to `matches[0]` there would pick a row by DOM order - the exact
+ * guess this function exists to prevent.
+ *
  * Refusing is the default for everything that is not proven: choosing between
  * two rows the relay cannot tell apart is how a task would silently run on the
  * wrong model, and the router exists precisely so that cannot happen.
@@ -167,7 +207,7 @@ export function findModelOption(
   options: readonly ModelOption[],
   label: string,
 ):
-  | { kind: "found"; option: ModelOption; mergedDuplicates: boolean }
+  | { kind: "found"; option: ModelOption; basis: ModelChoiceBasis }
   | { kind: "not_found"; available: readonly string[] }
   | {
       kind: "ambiguous";
@@ -177,7 +217,7 @@ export function findModelOption(
   const matches = options.filter((option) => option.name === label);
 
   if (matches.length === 1) {
-    return { kind: "found", option: matches[0] as ModelOption, mergedDuplicates: false };
+    return { kind: "found", option: matches[0] as ModelOption, basis: "unique_name" };
   }
 
   if (matches.length === 0) {
@@ -191,10 +231,18 @@ export function findModelOption(
 
     if (identities.every((identity) => identity === first)) {
       const usable = matches.filter(isUsableModelRow);
+
+      // One model rendered twice is one model, but it is still only clickable
+      // where the user can see it. No usable row means no row to click, and
+      // taking `matches[0]` instead would choose by DOM order.
+      if (usable.length === 0) {
+        return { kind: "ambiguous", reason: "no_usable_row", matches };
+      }
+
       return {
         kind: "found",
-        option: (usable[0] ?? matches[0]) as ModelOption,
-        mergedDuplicates: true,
+        option: usable[0] as ModelOption,
+        basis: "merged_identity",
       };
     }
 
@@ -204,7 +252,7 @@ export function findModelOption(
   const usable = matches.filter(isUsableModelRow);
 
   if (usable.length === 1) {
-    return { kind: "found", option: usable[0] as ModelOption, mergedDuplicates: false };
+    return { kind: "found", option: usable[0] as ModelOption, basis: "usable_row" };
   }
 
   return {
@@ -237,42 +285,35 @@ const MODEL_MENU_OPEN_EXPRESSION = `(() => {
 })()`;
 
 /*
- * The facts the resolution needs, collected and nothing else decided: the row
- * index, the name, whatever identity the page exposes, and the three measured
- * ways a row can be unusable - not rendered, not clickable, or scrolled out of
- * the menu viewport.
+ * One definition of "what this row is right now", shared verbatim by the read
+ * and by the click.
+ *
+ * They must agree: the resolution decides on facts read at one moment and the
+ * click lands a round trip later, so if the two expressions measured a row
+ * differently the re-check would be comparing two different meanings. Keeping
+ * a single source is what makes "the row still is what we decided on" a
+ * statement rather than a hope.
  */
-/** Exported so the expression itself, not a copy of it, is under test. */
-export const LIST_MODEL_OPTIONS_EXPRESSION = `(() => {
-  const popover = document.querySelector("div.cr-model-selector__popover[role='listbox']");
-  if (!popover) return JSON.stringify({ open: false, options: [] });
-  const items = Array.from(
-    popover.querySelectorAll("div.cr-model-selector__item[role='option']")
-  );
-  const scroller = popover.querySelector(".cr-slim-scroll") || popover;
-  const view = scroller.getBoundingClientRect();
-  const identityAttrs = ${JSON.stringify(IDENTITY_ATTRIBUTE_NAMES)};
+const MODEL_ROW_FACTS = `
+  const IDENTITY_ATTRS = ${JSON.stringify(STRONG_IDENTITY_ATTRIBUTE_NAMES)};
 
-  const options = items.map((item, index) => {
+  const readIdentity = (item) => {
+    for (const name of IDENTITY_ATTRS) {
+      const value = item.getAttribute(name);
+      if (value && value.trim()) return name + "=" + value.trim();
+    }
+    return null;
+  };
+
+  const readRowFacts = (item, view) => {
     const nameEl = item.querySelector(".cr-model-selector__item-name");
     const rect = item.getBoundingClientRect();
     const style = window.getComputedStyle(item);
 
-    let identity = null;
-    for (const name of identityAttrs) {
-      const value = item.getAttribute(name);
-      if (value && value.trim()) {
-        identity = value.trim();
-        break;
-      }
-    }
-
     return {
-      index: index,
       name: nameEl ? (nameEl.textContent || "").trim() : "",
-      selected: item.getAttribute("aria-selected") === "true",
+      identity: readIdentity(item),
       disabled: item.getAttribute("aria-disabled") === "true",
-      identity: identity,
       rendered:
         style.display !== "none" &&
         style.visibility !== "hidden" &&
@@ -288,22 +329,87 @@ export const LIST_MODEL_OPTIONS_EXPRESSION = `(() => {
         rect.right > view.left &&
         rect.left < view.right,
     };
+  };
+`;
+
+const MENU_SCROLLER = `
+  const scroller = popover.querySelector(".cr-slim-scroll") || popover;
+  const view = scroller.getBoundingClientRect();
+`;
+
+/*
+ * The facts the resolution needs, collected and nothing else decided: the row
+ * index, the name, whatever identity the page exposes, and the three measured
+ * ways a row can be unusable - not rendered, not clickable, or scrolled out of
+ * the menu viewport.
+ */
+/** Exported so the expression itself, not a copy of it, is under test. */
+export const LIST_MODEL_OPTIONS_EXPRESSION = `(() => {
+  const popover = document.querySelector("div.cr-model-selector__popover[role='listbox']");
+  if (!popover) return JSON.stringify({ open: false, options: [] });
+  const items = Array.from(
+    popover.querySelectorAll("div.cr-model-selector__item[role='option']")
+  );
+  ${MENU_SCROLLER}
+  ${MODEL_ROW_FACTS}
+
+  const options = items.map((item, index) => {
+    const facts = readRowFacts(item, view);
+
+    return {
+      index: index,
+      name: facts.name,
+      selected: item.getAttribute("aria-selected") === "true",
+      disabled: facts.disabled,
+      identity: facts.identity,
+      rendered: facts.rendered,
+      clickable: facts.clickable,
+      inViewport: facts.inViewport,
+    };
   });
 
   return JSON.stringify({ open: true, options });
 })()`;
 
 /*
- * Clicks the row the resolution picked, by position - not by name.
+ * Clicks the row the resolution picked, by position - not by name - and only
+ * after re-reading that row.
  *
- * Looking the label up again here would re-open the whole duplicate question,
- * so the row is addressed by index and the only check left is that the row
- * still says the label it was chosen for: if the menu changed between reading
- * it and clicking it, nothing is clicked.
+ * The menu can re-render between the read and the click (a quota badge
+ * landing, a virtualised list scrolling, a re-sort), so everything the
+ * resolution relied on is measured again here:
+ *
+ *   A. the row is still at that index
+ *   B. its name is still exactly the wanted label
+ *   C. it is still clickable: rendered, clickable, not disabled - and, when
+ *      being on screen is what selected it in the first place, still on screen
+ *   D. if it had an identity, it still has that exact identity
+ *
+ * D is the one that matters most and the one a name check cannot cover: the
+ * row at index 4 can still be called "Hy3" while now being a different model
+ * behind that name. Any drift and nothing is clicked at all - a stale click is
+ * worse than no click, because it silently runs the task on whatever the row
+ * turned into.
+ *
+ * The viewport half of C is only enforced when `requireViewport` says so, i.e.
+ * when "it was the only row on screen" is what chose this row. Rows the name
+ * alone identified are still clicked where they are: the menu is taller than
+ * its viewport and half the catalogue lives below the fold, so refusing those
+ * would break switches that have always worked.
+ *
+ * `waitUntilConfirmed` afterwards is a second, independent check (did the UI
+ * actually switch?), not a substitute for this one.
  */
-const CLICK_MODEL_OPTION_EXPRESSION = (request: { label: string; index: number }) => `(() => {
+const CLICK_MODEL_OPTION_EXPRESSION = (request: {
+  label: string;
+  index: number;
+  identity: string | null;
+  requireViewport: boolean;
+}) => `(() => {
   const wanted = ${JSON.stringify(request.label)};
   const at = ${request.index};
+  const expectedIdentity = ${JSON.stringify(request.identity)};
+  const requireViewport = ${request.requireViewport};
   const popover = document.querySelector("div.cr-model-selector__popover[role='listbox']");
   if (!popover) return JSON.stringify({ clicked: false, reason: "menu-not-open" });
   const items = Array.from(
@@ -311,11 +417,31 @@ const CLICK_MODEL_OPTION_EXPRESSION = (request: { label: string; index: number }
   );
   const item = items[at];
   if (!item) return JSON.stringify({ clicked: false, reason: "row-gone", count: items.length });
-  const nameEl = item.querySelector(".cr-model-selector__item-name");
-  const name = nameEl ? (nameEl.textContent || "").trim() : "";
-  if (name !== wanted) {
-    return JSON.stringify({ clicked: false, reason: "row-is-another-model", count: items.length });
+  ${MENU_SCROLLER}
+  ${MODEL_ROW_FACTS}
+
+  const facts = readRowFacts(item, view);
+  const count = items.length;
+
+  if (facts.name !== wanted) {
+    return JSON.stringify({ clicked: false, reason: "row-is-another-model", count: count });
   }
+  if (expectedIdentity !== null && facts.identity !== expectedIdentity) {
+    return JSON.stringify({ clicked: false, reason: "row-identity-drifted", count: count });
+  }
+  if (!facts.rendered) {
+    return JSON.stringify({ clicked: false, reason: "row-hidden", count: count });
+  }
+  if (facts.disabled) {
+    return JSON.stringify({ clicked: false, reason: "row-disabled", count: count });
+  }
+  if (!facts.clickable) {
+    return JSON.stringify({ clicked: false, reason: "row-not-clickable", count: count });
+  }
+  if (requireViewport && !facts.inViewport) {
+    return JSON.stringify({ clicked: false, reason: "row-offscreen", count: count });
+  }
+
   item.click();
   return JSON.stringify({ clicked: true });
 })()`;
@@ -439,15 +565,30 @@ export class WorkBuddyModelController {
 
       const clickPayload = parseJsonPayload<{ clicked?: boolean; reason?: string }>(
         await this.evaluate(
-          CLICK_MODEL_OPTION_EXPRESSION({ label, index: resolved.option.index }),
+          CLICK_MODEL_OPTION_EXPRESSION({
+            label,
+            index: resolved.option.index,
+            identity: resolved.option.identity,
+            // "The only row the user can see" is load-bearing exactly when it
+            // is what chose the row. Everything else is re-checked regardless.
+            requireViewport: resolved.basis !== "unique_name",
+          }),
         ),
         {},
       );
 
       if (clickPayload.clicked !== true) {
+        /*
+         * The row the resolution picked is no longer provably that model: the
+         * menu moved, the row moved, or the model behind the name changed.
+         * MODEL_AMBIGUOUS rather than MODEL_NOT_FOUND on purpose - the label is
+         * still in the menu, what is missing is the certainty, and the rule for
+         * missing certainty is to refuse rather than to click a neighbour.
+         */
         throw new WorkBuddyModelError(
-          "MODEL_NOT_FOUND",
-          `Could not click WorkBuddy model "${label}" (${clickPayload.reason ?? "unknown"})`,
+          "MODEL_AMBIGUOUS",
+          `WorkBuddy model row "${label}" changed before it could be clicked ` +
+            `(${clickPayload.reason ?? "unknown"}); refusing to guess`,
           options.map((option) => option.name),
         );
       }

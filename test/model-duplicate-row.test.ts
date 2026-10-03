@@ -17,6 +17,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  LIST_MODEL_OPTIONS_EXPRESSION,
   WorkBuddyModelController,
   WorkBuddyModelError,
   findModelOption,
@@ -151,6 +152,8 @@ type RowSpec = {
   hidden?: boolean;
   disabled?: boolean;
   selected?: boolean;
+  /** Pushes the row further down the menu, i.e. out of the scroll viewport. */
+  offsetY?: number;
 };
 
 type PageState = {
@@ -159,6 +162,8 @@ type PageState = {
   clickedRows: number[];
   /** Whether a click really switches the model - false models a dead click. */
   applies: boolean;
+  /** How many times the shipped read expression has run against this page. */
+  reads: number;
 };
 
 /** One row, at the position it was read at: position decides what is on screen. */
@@ -175,7 +180,7 @@ function rowNode(spec: RowSpec, index: number, onClick: () => void): StubNode {
       ...(spec.attrs ?? {}),
     },
     rect: {
-      top: VIEWPORT.top + index * ROW_HEIGHT,
+      top: VIEWPORT.top + index * ROW_HEIGHT + (spec.offsetY ?? 0),
       left: VIEWPORT.left,
       width: VIEWPORT.width,
       height: ROW_HEIGHT,
@@ -204,12 +209,21 @@ function rowNode(spec: RowSpec, index: number, onClick: () => void): StubNode {
  * The measured page, rebuilt for every evaluation so the expressions always
  * read the current state and never a cached copy of it.
  */
-function makePage(options: { triggerLabel: string; rows: RowSpec[]; applies?: boolean }) {
+type RowsSource = RowSpec[] | ((state: PageState) => RowSpec[]);
+
+/**
+ * `rows` may be a function of the live page so a case can model the menu
+ * re-rendering: everything up to and including the read sees one DOM, and the
+ * click - one round trip later - sees another. That window is exactly what the
+ * click-time revalidation exists for.
+ */
+function makePage(options: { triggerLabel: string; rows: RowsSource; applies?: boolean }) {
   const state: PageState = {
     open: false,
     triggerLabel: options.triggerLabel,
     clickedRows: [],
     applies: options.applies ?? true,
+    reads: 0,
   };
 
   const build = (): StubNode => {
@@ -229,7 +243,8 @@ function makePage(options: { triggerLabel: string; rows: RowSpec[]; applies?: bo
       },
     });
 
-    const rows = options.rows.map((spec, index) =>
+    const specs = typeof options.rows === "function" ? options.rows(state) : options.rows;
+    const rows = specs.map((spec, index) =>
       rowNode(spec, index, () => {
         state.clickedRows.push(index);
         if (state.applies) {
@@ -288,7 +303,12 @@ function makePage(options: { triggerLabel: string; rows: RowSpec[]; applies?: bo
       `return (${expression})`,
     ) as (doc: unknown, win: unknown) => unknown;
 
-    return run(document, window_);
+    const result = run(document, window_);
+
+    // Counted after the read, so the read itself sees the pre-drift DOM.
+    if (expression === LIST_MODEL_OPTIONS_EXPRESSION) state.reads += 1;
+
+    return result;
   };
 
   const controller = new WorkBuddyModelController(evaluate, {
@@ -403,6 +423,19 @@ describe("a model the menu renders twice", () => {
     expect(state.clickedRows).toEqual([]);
   });
 
+  it("refuses duplicates that are provably one model but none of them usable", async () => {
+    // The identity says the two rows are the same model; it says nothing about
+    // which one to click, and both are below the fold. Taking the first row
+    // anyway would be choosing by DOM order.
+    const { state, controller } = makePage({
+      triggerLabel: "Hy4 preview",
+      rows: productionCatalog([10, 18], () => ({ "data-model-id": "hy3" })),
+    });
+
+    await expectAmbiguous(controller.selectModel("Hy3"), "no_usable_row");
+    expect(state.clickedRows).toEqual([]);
+  });
+
   it("keeps a single row working exactly as before", async () => {
     const { state, controller } = makePage({
       triggerLabel: "Hy4 preview",
@@ -452,6 +485,133 @@ describe("a click the page never confirms", () => {
   });
 });
 
+/** Refused at click time: the row is no longer the one the resolution chose. */
+async function expectRefusedClick(
+  promise: Promise<unknown>,
+  reason: string,
+): Promise<void> {
+  const error = await promise.catch((thrown: unknown) => thrown);
+
+  expect(error).toBeInstanceOf(WorkBuddyModelError);
+  expect((error as WorkBuddyModelError).code).toBe("MODEL_AMBIGUOUS");
+  expect((error as WorkBuddyModelError).message).toContain(reason);
+}
+
+/**
+ * The menu is live and the relay reads it once, then clicks. These cases move
+ * the row in between - the window the click-time revalidation is there for.
+ */
+describe("a row that changes after it was read", () => {
+  it("refuses to click when the row is still called Hy3 but is another model", async () => {
+    // Read: index 4, "Hy3", data-model-id=hy3-a. Before the click the menu
+    // re-renders and index 4 is still "Hy3" - with a different identity.
+    const before = productionCatalog([4], () => ({ "data-model-id": "hy3-a" }));
+    const after = productionCatalog([4], () => ({ "data-model-id": "hy3-b" }));
+
+    const { state, controller } = makePage({
+      triggerLabel: "Hy4 preview",
+      rows: (page) => (page.reads >= 1 ? after : before),
+    });
+
+    await expectRefusedClick(controller.selectModel("Hy3"), "row-identity-drifted");
+    // The name matched, so only the identity could have caught this. Clicking
+    // would have run the task on whatever model the row turned into.
+    expect(state.clickedRows).toEqual([]);
+    expect(state.triggerLabel).toBe("Hy4 preview");
+  });
+
+  it("refuses to click a row that became disabled", async () => {
+    const rows = productionCatalog([4, 18], () => ({}));
+    const drifted = rows.map((row, at) => (at === 4 ? { ...row, disabled: true } : row));
+
+    const { state, controller } = makePage({
+      triggerLabel: "Hy4 preview",
+      rows: (page) => (page.reads >= 1 ? drifted : rows),
+    });
+
+    await expectRefusedClick(controller.selectModel("Hy3"), "row-disabled");
+    expect(state.clickedRows).toEqual([]);
+  });
+
+  it("refuses to click a row that scrolled out of the viewport", async () => {
+    // Row 4 was picked precisely because it was the one on screen.
+    const rows = productionCatalog([4, 18], () => ({}));
+    const drifted = rows.map((row, at) => (at === 4 ? { ...row, offsetY: 2000 } : row));
+
+    const { state, controller } = makePage({
+      triggerLabel: "Hy4 preview",
+      rows: (page) => (page.reads >= 1 ? drifted : rows),
+    });
+
+    await expectRefusedClick(controller.selectModel("Hy3"), "row-offscreen");
+    expect(state.clickedRows).toEqual([]);
+  });
+
+  it("refuses to click a row that stopped being rendered", async () => {
+    const rows = productionCatalog([4, 18], () => ({}));
+    const drifted = rows.map((row, at) => (at === 4 ? { ...row, hidden: true } : row));
+
+    const { state, controller } = makePage({
+      triggerLabel: "Hy4 preview",
+      rows: (page) => (page.reads >= 1 ? drifted : rows),
+    });
+
+    await expectRefusedClick(controller.selectModel("Hy3"), "row-hidden");
+    expect(state.clickedRows).toEqual([]);
+  });
+
+  it("refuses to click a row the menu replaced with another model", async () => {
+    const rows = productionCatalog([4, 18], () => ({}));
+    const drifted = rows.map((row, at) => (at === 4 ? { ...row, name: "GLM-5.3-Flash" } : row));
+
+    const { state, controller } = makePage({
+      triggerLabel: "Hy4 preview",
+      rows: (page) => (page.reads >= 1 ? drifted : rows),
+    });
+
+    await expectRefusedClick(controller.selectModel("Hy3"), "row-is-another-model");
+    expect(state.clickedRows).toEqual([]);
+  });
+});
+
+/**
+ * Identity is `attribute=value`, not the bare value: two rows that agree on a
+ * string but not on where it came from are not one proven model.
+ */
+describe("identity is read with the attribute it came from", () => {
+  it("does not merge rows that share a value across different attributes", async () => {
+    const { state, controller } = makePage({
+      triggerLabel: "Hy4 preview",
+      rows: productionCatalog([4, 18], (position) =>
+        position === 4 ? { "data-model-id": "hy3" } : { "data-model-key": "hy3" },
+      ),
+    });
+
+    await expectAmbiguous(controller.selectModel("Hy3"), "identity_conflict");
+    // Same name, same value, different source: that is an unproven merge, and
+    // an unproven merge is a guess.
+    expect(state.clickedRows).toEqual([]);
+  });
+});
+
+/** A label that appears once never depended on the viewport to be resolved. */
+describe("a row the name alone identifies", () => {
+  it("is still clicked when it sits below the fold", async () => {
+    // Half the catalogue is scrolled out of the 268px viewport. Refusing those
+    // rows would break switches that have always worked, so "on screen" is
+    // only re-checked when it is what chose the row.
+    const { state, controller } = makePage({
+      triggerLabel: "Hy4 preview",
+      rows: productionCatalog([18], () => ({})),
+    });
+
+    const result = await controller.selectModel("Hy3");
+
+    expect(result.current).toBe("Hy3");
+    expect(state.clickedRows).toEqual([18]);
+  });
+});
+
 /** The resolution itself, without a page. */
 describe("the duplicate-row resolution", () => {
   const row = (over: Partial<ModelOption> & { index: number; name: string }): ModelOption => ({
@@ -481,7 +641,7 @@ describe("the duplicate-row resolution", () => {
       "Hy3",
     );
 
-    expect(same.kind === "found" && same.mergedDuplicates).toBe(true);
+    expect(same.kind === "found" && same.basis).toBe("merged_identity");
 
     const different = findModelOption(
       [
@@ -495,6 +655,7 @@ describe("the duplicate-row resolution", () => {
   });
 
   it("falls back to the usable row when the page identifies nothing", () => {
+    // The measured production shape: row 4 on screen, row 18 below the fold.
     const resolved = findModelOption(
       [
         row({ index: 4, name: "Hy3" }),
@@ -504,7 +665,21 @@ describe("the duplicate-row resolution", () => {
     );
 
     expect(resolved.kind === "found" && resolved.option.index).toBe(4);
-    expect(resolved.kind === "found" && resolved.mergedDuplicates).toBe(false);
+    expect(resolved.kind === "found" && resolved.basis).toBe("usable_row");
+  });
+
+  it("refuses duplicates that are the same model but none of them usable", () => {
+    // Same identity on both rows, both scrolled out of the menu. Proving they
+    // are one model says nothing about which one to click, so nothing is.
+    const resolved = findModelOption(
+      [
+        row({ index: 10, name: "Hy3", identity: "data-model-id=hy3", inViewport: false }),
+        row({ index: 18, name: "Hy3", identity: "data-model-id=hy3", inViewport: false }),
+      ],
+      "Hy3",
+    );
+
+    expect(resolved.kind === "ambiguous" && resolved.reason).toBe("no_usable_row");
   });
 
   it("never picks a row just because it came first", () => {
@@ -514,5 +689,17 @@ describe("the duplicate-row resolution", () => {
     );
 
     expect(resolved.kind).toBe("ambiguous");
+  });
+
+  it("refuses two usable duplicates the page does not identify", () => {
+    const resolved = findModelOption(
+      [
+        row({ index: 10, name: "Hy3", inViewport: false }),
+        row({ index: 18, name: "Hy3", inViewport: false }),
+      ],
+      "Hy3",
+    );
+
+    expect(resolved.kind === "ambiguous" && resolved.reason).toBe("no_usable_row");
   });
 });
