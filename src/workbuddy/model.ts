@@ -31,6 +31,23 @@
  * Exact equality is required, not merely preferred: the catalog contains both
  * "GLM-5.3" and "GLM-5.3-Flash", so a substring match for "GLM-5.3" would
  * silently resolve to the wrong row.
+ *
+ * THE MENU ALSO RENDERS THE SAME MODEL TWICE.
+ *
+ * Measured on the live page (2026-10-03, menu opened, 23 rows): "Hy3" appears
+ * at row 4 and again at row 18. The two rows are byte-identical - same
+ * `outerHTML`, same text ("Hy3限时免费0.00x"), same classes, same
+ * `aria-selected` / `aria-disabled` - and neither carries any stable identity:
+ * the only attributes are `class`, `role`, `aria-selected`, `aria-disabled`,
+ * and no descendant has an `id` or a `data-*` either.
+ *
+ * The one thing that does tell them apart is where they are: the menu body is
+ * a `div.cr-slim-scroll` viewport 268px tall showing ~8 of the 23 rows, and
+ * row 18 sits at y=1203 - below the viewport, clipped, not on screen for the
+ * user - while row 4 sits at y=755, inside it. Counting rows as "two models"
+ * therefore failed a switch that was perfectly safe, so the duplicate is now
+ * tolerated under the rules in `findModelOption`: never by picking the first
+ * match, and only when the rows are provably the same thing.
  */
 
 export type WorkBuddyModelErrorCode =
@@ -57,10 +74,49 @@ export class WorkBuddyModelError extends Error {
   }
 }
 
+/**
+ * Attributes the page could use to say which model a row *is*, as opposed to
+ * what it is called.
+ *
+ * None of them is present today - the measured Hy3 rows carry only `class`,
+ * `role`, `aria-selected` and `aria-disabled` - so `identity` is null on the
+ * live page and the resolution falls through to the visibility rules. The list
+ * is read anyway, in this order, so that a UI that starts identifying its rows
+ * is understood without another production incident. It deliberately excludes
+ * `id`: React hands those out per render, so two renders of one model would
+ * look like two models.
+ */
+export const IDENTITY_ATTRIBUTE_NAMES = [
+  "data-model-id",
+  "data-model",
+  "data-model-key",
+  "data-id",
+  "data-key",
+  "data-value",
+  "data-testid",
+  "value",
+  "href",
+] as const;
+
 export type ModelOption = {
+  /** Position in the open menu. Used to click the row that was decided on. */
+  index: number;
   name: string;
   selected: boolean;
   disabled: boolean;
+  /** Stable identity of the model behind the row, or null when the page hides it. */
+  identity: string | null;
+  /** The row is rendered at all: not display:none, not visibility:hidden, has a box. */
+  rendered: boolean;
+  /** The row can be clicked: pointer events are on and nothing disabled it. */
+  clickable: boolean;
+  /**
+   * The row is inside the menu's scroll viewport, i.e. actually on screen.
+   *
+   * A row can be rendered and clickable and still be scrolled out of view -
+   * which is exactly the difference between the two Hy3 rows.
+   */
+  inViewport: boolean;
 };
 
 export type ModelSwitchResult = {
@@ -69,29 +125,93 @@ export type ModelSwitchResult = {
   current: string;
 };
 
+/** Why a label that matched more than one row could not be trusted. */
+export type ModelAmbiguityReason =
+  /** The rows carry identities, and they disagree: two models, one name. */
+  | "identity_conflict"
+  /** No row is on screen and clickable, so there is nothing to choose. */
+  | "no_usable_row"
+  /** More than one row is on screen and clickable, and nothing tells them apart. */
+  | "indistinguishable";
+
 /**
- * Pure lookup so the exact-match rule is testable without a browser. Returns
- * the single matching option, or a discriminated miss explaining whether the
- * label was absent or resolved to more than one row.
+ * Whether a row is one the relay may actually use: rendered, clickable, and
+ * inside the scroll viewport.
+ *
+ * "Rendered" alone is not enough. A virtualised or oversized list keeps its
+ * off-screen rows in the DOM with their geometry and their pointer events, so
+ * `display`, `visibility` and `offsetParent` all say "fine" for a row the user
+ * cannot see and did not scroll to.
+ */
+export function isUsableModelRow(option: ModelOption): boolean {
+  return option.rendered && option.clickable && option.inViewport && !option.disabled;
+}
+
+/**
+ * Pure resolution so the duplicate-row rule is testable without a browser.
+ *
+ * One match keeps today's behaviour. Several matches are only tolerated when
+ * they are provably the same model:
+ *
+ *   every row carries an identity and they are all equal  -> one model,
+ *                                                            rendered twice
+ *   otherwise, and exactly one row is usable              -> that row
+ *   identities present and different                      -> refuse
+ *   nothing usable, or several usable and indistinguishable -> refuse
+ *
+ * Refusing is the default for everything that is not proven: choosing between
+ * two rows the relay cannot tell apart is how a task would silently run on the
+ * wrong model, and the router exists precisely so that cannot happen.
  */
 export function findModelOption(
   options: readonly ModelOption[],
   label: string,
 ):
-  | { kind: "found"; option: ModelOption }
+  | { kind: "found"; option: ModelOption; mergedDuplicates: boolean }
   | { kind: "not_found"; available: readonly string[] }
-  | { kind: "ambiguous"; matches: readonly ModelOption[] } {
+  | {
+      kind: "ambiguous";
+      reason: ModelAmbiguityReason;
+      matches: readonly ModelOption[];
+    } {
   const matches = options.filter((option) => option.name === label);
 
   if (matches.length === 1) {
-    return { kind: "found", option: matches[0] as ModelOption };
+    return { kind: "found", option: matches[0] as ModelOption, mergedDuplicates: false };
   }
 
-  if (matches.length > 1) {
-    return { kind: "ambiguous", matches };
+  if (matches.length === 0) {
+    return { kind: "not_found", available: options.map((option) => option.name) };
   }
 
-  return { kind: "not_found", available: options.map((option) => option.name) };
+  const identities = matches.map((option) => option.identity);
+
+  if (identities.every((identity) => identity !== null)) {
+    const first = identities[0] as string;
+
+    if (identities.every((identity) => identity === first)) {
+      const usable = matches.filter(isUsableModelRow);
+      return {
+        kind: "found",
+        option: (usable[0] ?? matches[0]) as ModelOption,
+        mergedDuplicates: true,
+      };
+    }
+
+    return { kind: "ambiguous", reason: "identity_conflict", matches };
+  }
+
+  const usable = matches.filter(isUsableModelRow);
+
+  if (usable.length === 1) {
+    return { kind: "found", option: usable[0] as ModelOption, mergedDuplicates: false };
+  }
+
+  return {
+    kind: "ambiguous",
+    reason: usable.length === 0 ? "no_usable_row" : "indistinguishable",
+    matches,
+  };
 }
 
 const READ_CURRENT_MODEL_EXPRESSION = `(() => {
@@ -116,38 +236,87 @@ const MODEL_MENU_OPEN_EXPRESSION = `(() => {
   return JSON.stringify({ open: !!popover });
 })()`;
 
-const LIST_MODEL_OPTIONS_EXPRESSION = `(() => {
+/*
+ * The facts the resolution needs, collected and nothing else decided: the row
+ * index, the name, whatever identity the page exposes, and the three measured
+ * ways a row can be unusable - not rendered, not clickable, or scrolled out of
+ * the menu viewport.
+ */
+/** Exported so the expression itself, not a copy of it, is under test. */
+export const LIST_MODEL_OPTIONS_EXPRESSION = `(() => {
   const popover = document.querySelector("div.cr-model-selector__popover[role='listbox']");
   if (!popover) return JSON.stringify({ open: false, options: [] });
   const items = Array.from(
     popover.querySelectorAll("div.cr-model-selector__item[role='option']")
   );
-  const options = items.map((item) => {
+  const scroller = popover.querySelector(".cr-slim-scroll") || popover;
+  const view = scroller.getBoundingClientRect();
+  const identityAttrs = ${JSON.stringify(IDENTITY_ATTRIBUTE_NAMES)};
+
+  const options = items.map((item, index) => {
     const nameEl = item.querySelector(".cr-model-selector__item-name");
+    const rect = item.getBoundingClientRect();
+    const style = window.getComputedStyle(item);
+
+    let identity = null;
+    for (const name of identityAttrs) {
+      const value = item.getAttribute(name);
+      if (value && value.trim()) {
+        identity = value.trim();
+        break;
+      }
+    }
+
     return {
+      index: index,
       name: nameEl ? (nameEl.textContent || "").trim() : "",
       selected: item.getAttribute("aria-selected") === "true",
       disabled: item.getAttribute("aria-disabled") === "true",
+      identity: identity,
+      rendered:
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0,
+      clickable:
+        style.pointerEvents !== "none" &&
+        item.getAttribute("aria-disabled") !== "true" &&
+        !item.hasAttribute("disabled"),
+      inViewport:
+        rect.bottom > view.top &&
+        rect.top < view.bottom &&
+        rect.right > view.left &&
+        rect.left < view.right,
     };
   });
+
   return JSON.stringify({ open: true, options });
 })()`;
 
-const CLICK_MODEL_OPTION_EXPRESSION = (label: string) => `(() => {
-  const wanted = ${JSON.stringify(label)};
+/*
+ * Clicks the row the resolution picked, by position - not by name.
+ *
+ * Looking the label up again here would re-open the whole duplicate question,
+ * so the row is addressed by index and the only check left is that the row
+ * still says the label it was chosen for: if the menu changed between reading
+ * it and clicking it, nothing is clicked.
+ */
+const CLICK_MODEL_OPTION_EXPRESSION = (request: { label: string; index: number }) => `(() => {
+  const wanted = ${JSON.stringify(request.label)};
+  const at = ${request.index};
   const popover = document.querySelector("div.cr-model-selector__popover[role='listbox']");
   if (!popover) return JSON.stringify({ clicked: false, reason: "menu-not-open" });
   const items = Array.from(
     popover.querySelectorAll("div.cr-model-selector__item[role='option']")
   );
-  const hits = items.filter((item) => {
-    const nameEl = item.querySelector(".cr-model-selector__item-name");
-    return nameEl && (nameEl.textContent || "").trim() === wanted;
-  });
-  if (hits.length !== 1) {
-    return JSON.stringify({ clicked: false, reason: "no-unique-match", count: hits.length });
+  const item = items[at];
+  if (!item) return JSON.stringify({ clicked: false, reason: "row-gone", count: items.length });
+  const nameEl = item.querySelector(".cr-model-selector__item-name");
+  const name = nameEl ? (nameEl.textContent || "").trim() : "";
+  if (name !== wanted) {
+    return JSON.stringify({ clicked: false, reason: "row-is-another-model", count: items.length });
   }
-  hits[0].click();
+  item.click();
   return JSON.stringify({ clicked: true });
 })()`;
 
@@ -214,11 +383,18 @@ export class WorkBuddyModelController {
     return payload.model ?? null;
   }
 
-  /** Every row the real UI offers, in UI order. Opens the menu to read them. */
+  /**
+   * Every distinct label the real UI offers, in UI order. Opens the menu to
+   * read them.
+   *
+   * Distinct: the menu lists "Hy3" twice, and a caller reading this as a
+   * catalogue would otherwise be told the model exists twice.
+   */
   async listAvailableModels(): Promise<string[]> {
     await this.openMenu();
     try {
-      return (await this.readOptions()).map((option) => option.name);
+      const names = (await this.readOptions()).map((option) => option.name);
+      return names.filter((name, index) => names.indexOf(name) === index);
     } finally {
       await this.closeMenu();
     }
@@ -255,13 +431,16 @@ export class WorkBuddyModelController {
       if (resolved.kind === "ambiguous") {
         throw new WorkBuddyModelError(
           "MODEL_AMBIGUOUS",
-          `Label "${label}" matched ${resolved.matches.length} WorkBuddy rows`,
+          `Label "${label}" matched ${resolved.matches.length} WorkBuddy rows ` +
+            `that cannot be told apart (${resolved.reason}); refusing to guess`,
           resolved.matches.map((option) => option.name),
         );
       }
 
       const clickPayload = parseJsonPayload<{ clicked?: boolean; reason?: string }>(
-        await this.evaluate(CLICK_MODEL_OPTION_EXPRESSION(label)),
+        await this.evaluate(
+          CLICK_MODEL_OPTION_EXPRESSION({ label, index: resolved.option.index }),
+        ),
         {},
       );
 
@@ -326,10 +505,18 @@ export class WorkBuddyModelController {
       );
     }
 
-    return payload.options.map((option) => ({
+    return payload.options.map((option, index) => ({
+      index: typeof option?.index === "number" ? option.index : index,
       name: typeof option?.name === "string" ? option.name : "",
       selected: option?.selected === true,
       disabled: option?.disabled === true,
+      identity:
+        typeof option?.identity === "string" && option.identity.length > 0
+          ? option.identity
+          : null,
+      rendered: option?.rendered === true,
+      clickable: option?.clickable === true,
+      inViewport: option?.inViewport === true,
     }));
   }
 
