@@ -361,6 +361,15 @@ async function makeHarness(
     quotaProbeError: null,
   } as Harness;
 
+  /*
+   * The requestId of the last RESULT the relay handed to the extension. The
+   * real extension echoes a delivery's requestId back as the acknowledgement's
+   * requestId, and the relay now binds the two (a stray ack naming another
+   * delivery is rejected), so the fake has to remember the id it was given
+   * rather than invent one.
+   */
+  let lastResultRequestId: string | undefined;
+
   const bridge = {
     hasClient: () => h.bridgeConnected,
     onMessage: (handler: (message: ExtensionInbound) => Promise<void>) => {
@@ -377,6 +386,7 @@ async function makeHarness(
        * relay waiting on a delivery that already happened.
        */
       if (message.type === "send_to_chatgpt") {
+        lastResultRequestId = message.requestId;
         /*
          * The extension answers on its own schedule, and the answer is about a
          * delivery the relay has to have recorded first. The fake therefore
@@ -718,8 +728,13 @@ async function makeHarness(
   h.waitHooksFor = (id: number) =>
     records.find((r) => r.id === id)?.waitHooks.length ?? 0;
 
-  /** Acknowledges the delivery the extension has just made. */
-  h.ackResult = async (requestId = "req-ack"): Promise<void> => {
+  /**
+   * Acknowledges the delivery the extension has just made. With no argument it
+   * echoes the requestId of the RESULT the relay last sent, which is what the
+   * real extension does; a caller may pass a foreign id to exercise the
+   * wrong-delivery rejection.
+   */
+  h.ackResult = async (requestId = lastResultRequestId ?? "req-ack"): Promise<void> => {
     await h.raw({ type: "chatgpt_send_result", requestId, ok: true, sent: true });
   };
 

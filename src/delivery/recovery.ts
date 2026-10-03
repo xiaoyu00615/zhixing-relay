@@ -12,7 +12,7 @@
  * no bridge, no DOM.
  */
 
-import { isTaskExecutionStage, stageRank } from "./stage.js";
+import { isTaskExecutionStage, stageRank, type TaskExecutionStage } from "./stage.js";
 
 /** The task record the relay persists while a round is in flight. */
 export type RecoverableTask = {
@@ -25,6 +25,13 @@ export type RecoverableTask = {
   dispatchId?: string | null | undefined;
   attempt?: number | null | undefined;
   execution?: { stage?: unknown } | null | undefined;
+  /**
+   * True when a `workbuddy_result` outbox entry for this task already sits in
+   * the durable queue. The outbox is the source of truth for a result that has
+   * not yet been delivered: its presence means the answer is safe and must be
+   * re-delivered, never re-fetched from WorkBuddy.
+   */
+  hasPendingResult?: boolean | undefined;
 };
 
 export type RecoveryPlan =
@@ -34,9 +41,33 @@ export type RecoveryPlan =
    */
   | { kind: "resume_wait"; taskId: string; outboundId: string; modelId?: string | null }
   /** An answer already persisted; re-deliver THAT answer, never re-run the task. */
-  | { kind: "redeliver_result" }
+  | { kind: "redeliver_result"; taskId: string }
+  /**
+   * The answer was already handed to the extension (durable RESULT_DELIVERED /
+   * RESULT_ACKED evidence exists) but the round is still open. Do NOT re-deliver
+   * and do NOT re-wait WorkBuddy: the only safe move is to re-arm the lease and
+   * let the acknowledgement - or a thread observation - close the round.
+   */
+  | { kind: "wait_ack"; taskId: string }
   /** Only the queue needs attention. */
   | { kind: "flush_queue" };
+
+/**
+ * A stable identity for one logical delivery of one logical result.
+ *
+ * Built only from durable facts (task id, dispatch id, the WorkBuddy message
+ * the answer came from), so it is identical across every crash, restart and
+ * recovery the same answer walks through. The bridge sink keys its idempotency
+ * on this, which is what lets a recovery replay the delivery without injecting
+ * the answer into ChatGPT a second time.
+ */
+export function deliveryIdFor(input: {
+  taskId: string;
+  workbuddyMessageId: string;
+  dispatchId?: string | null;
+}): string {
+  return `delivery:${input.taskId}#${input.dispatchId ?? "*"}#${input.workbuddyMessageId}`;
+}
 
 /** Statuses that mean the round is still alive and only needs a listener. */
 const RUNNING_STATUSES = new Set([
@@ -74,21 +105,62 @@ export function sendIsProven(stage: string): boolean {
 /**
  * The whole restart decision.
  *
- * The order matters: an answer that has already been persisted outranks
- * everything, because re-delivering it is safe while re-running its task never
- * is. A task that only ever reached the composer is recovered by listening;
- * one that was never shown is left to the queue.
+ * The order matters: the durable outbox outranks everything, because a result
+ * that already sits in the queue is safe to re-deliver while re-running its
+ * task never is. Next comes proof that the extension already took the answer:
+ * re-delivering it again would be a duplicate, so the round is parked on its
+ * lease. Only then does a message still in WorkBuddy justify a listener, and a
+ * task that was never shown is left to the queue.
  */
 export function planRecovery(task: RecoverableTask | null): RecoveryPlan {
   if (!task) return { kind: "flush_queue" };
 
+  const stage = durableStage(task);
+
   /*
-   * `result_pending` and `sent_to_gpt` both mean a persisted answer is waiting
-   * for ChatGPT. The RESULT is in the durable queue, so all the recovery has
-   * to do is hand it to the extension again.
+   * 1. The durable record already proves the extension received the answer
+   *    (RESULT_DELIVERED or RESULT_ACKED on the ledger). Re-sending it again
+   *    would duplicate the message in ChatGPT even with the sink's idempotency
+   *    gate - the gate is a backstop, never a license to re-send. The only
+   *    honest move is to wait for the acknowledgement (or a thread observation)
+   *    to close the round; the lease is re-armed by the caller so a lost ack
+   *    still expires instead of hanging for ever.
+   *
+   *    This check outranks `hasPendingResult` on purpose: a crash can leave the
+   *    outbox entry in place after the ledger already recorded the delivery
+   *    (the outbox is removed only after RESULT_DELIVERED is written). When both
+   *    are present, the delivery is the stronger proof, so we park on the lease
+   *    rather than risk a duplicate.
    */
-  if (task.status === "result_pending" || task.status === "sent_to_gpt") {
-    return { kind: "redeliver_result" };
+  if (stageRank(stage as TaskExecutionStage) >= stageRank("RESULT_DELIVERED")) {
+    return { kind: "wait_ack", taskId: task.taskId };
+  }
+
+  /*
+   * 2. The outbox is the source of truth for a result that has been received
+   *    but not yet proven delivered. Its presence means the answer is durable
+   *    and must be handed to the extension again - never re-fetched from
+   *    WorkBuddy, which would produce a second logical result. This covers the
+   *    "persist crash window": the queue holds the answer even when the live
+   *    status still says waiting_workbuddy.
+   */
+  if (task.hasPendingResult) {
+    return { kind: "redeliver_result", taskId: task.taskId };
+  }
+
+  /*
+   * 3. The ledger names a result stage (the answer was received, or was even
+   *    "persisted") but neither the outbox nor a delivery exists. That is a
+   *    contradiction: the persist path enqueues the outbox BEFORE it writes
+   *    RESULT_PERSISTED, so a RESULT_PERSISTED with no payload can only mean the
+   *    durable outbox was lost, and a RESULT_RECEIVED with no outbox means the
+   *    answer was never queued. Re-waiting WorkBuddy would re-run the task and
+   *    re-fetch an answer that is already gone, so fail closed: do nothing that
+   *    can invent a result or re-run the task. A human reconciles it. No
+   *    resume_wait, no redeliver.
+   */
+  if (stageRank(stage as TaskExecutionStage) >= stageRank("RESULT_RECEIVED")) {
+    return { kind: "flush_queue" };
   }
 
   const outboundId = task.workbuddyOutboundMessageId;
@@ -103,9 +175,11 @@ export function planRecovery(task: RecoverableTask | null): RecoveryPlan {
   }
 
   /*
-   * A record with no outbound id and no queued answer explains nothing, and the
-   * only thing that can still be true is that no send happened: leave it to
-   * the queue rather than inventing a message.
+   * A record that names a result stage but has neither the outbox nor delivery
+   * evidence is contradictory (the persist path always queues before it writes
+   * RESULT_PERSISTED). The conservative reading is "do nothing that can invent a
+   * result or re-run the task": a human reconciles it. No resume_wait, no
+   * redeliver.
    */
   return { kind: "flush_queue" };
 }

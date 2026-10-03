@@ -102,6 +102,40 @@ export class RelayStore {
   }
 
   /**
+   * Returns the durable `workbuddy_result` outbox entry for a task, if one
+   * already exists. Keyed on `(taskId, workbuddyMessageId)` - the result
+   * identity - so a recovery (or a re-delivery) can see the answer is already
+   * safe without re-fetching it from WorkBuddy.
+   */
+  async findPendingResult(
+    taskId: string,
+    workbuddyMessageId: string,
+  ): Promise<PendingItem | null> {
+    const match = this.state.pending.find(
+      (item) =>
+        item.kind === "workbuddy_result" &&
+        item.taskId === taskId &&
+        item.workbuddyMessageId === workbuddyMessageId,
+    );
+    return match ?? null;
+  }
+
+  /**
+   * Drops every `workbuddy_result` outbox entry for a task.
+   *
+   * Called when the round that produced the answer closes: the answer has been
+   * delivered and acknowledged, or released after its lease, so the durable
+   * copy is no longer needed and must not linger to be re-delivered later.
+   */
+  async removePendingResultForTask(taskId: string): Promise<void> {
+    await this.mutate((state) => {
+      state.pending = state.pending.filter(
+        (item) => !(item.kind === "workbuddy_result" && item.taskId === taskId),
+      );
+    });
+  }
+
+  /**
    * Drops one queued item, by id.
    *
    * The only caller is a RESULT that ChatGPT acknowledged: the durable copy of

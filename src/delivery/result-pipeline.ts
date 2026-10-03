@@ -23,7 +23,23 @@ import type { RelayStore } from "../store.js";
 import type { PendingItem } from "../types.js";
 import { isoNow, makeId } from "../utils.js";
 import type { TaskExecutionStage } from "./stage.js";
-import { ResultDeliveryLedger, resultDeliveryKey } from "./recovery.js";
+import { ResultDeliveryLedger, deliveryIdFor, resultDeliveryKey } from "./recovery.js";
+
+/**
+ * Thrown when the same result identity (task + WorkBuddy message) is asked to
+ * persist two different payloads. That can only mean the outbox and a fresh
+ * answer disagree about what this task produced, so the answer is not trusted:
+ * it is failed closed rather than overwriting the durable copy.
+ */
+export class ResultIdentityContradiction extends Error {
+  constructor(taskId: string, workbuddyMessageId: string) {
+    super(
+      `result identity contradiction for task ${taskId} message ${workbuddyMessageId}: ` +
+        `a second, different payload was offered for an already-persisted result`,
+    );
+    this.name = "ResultIdentityContradiction";
+  }
+}
 
 /** The write a stage change makes through to the ledger. */
 export type StageWriter = (input: {
@@ -95,6 +111,12 @@ export class ResultPipeline {
    * Nothing is delivered here. The queue entry is what survives a crash in the
    * delivery window, and it is the reason the answer can be re-sent without
    * WorkBuddy being asked to run the task again.
+   *
+   * Idempotent on the result identity `(taskId, workbuddyMessageId)`: a second
+   * call for the same answer returns the durable copy already on the queue
+   * instead of appending a second logical result. A second call with a
+   * different payload is a contradiction and is failed closed - the outbox is
+   * never silently overwritten.
    */
   async persist(input: {
     taskId: string;
@@ -102,6 +124,18 @@ export class ResultPipeline {
     text: string;
     detail?: Record<string, unknown>;
   }): Promise<PendingItem> {
+    const existing = await this.store.findPendingResult(
+      input.taskId,
+      input.workbuddyMessageId,
+    );
+
+    if (existing) {
+      if (existing.text !== input.text) {
+        throw new ResultIdentityContradiction(input.taskId, input.workbuddyMessageId);
+      }
+      return existing;
+    }
+
     const item: PendingItem = {
       kind: "workbuddy_result",
       id: makeId("pending-wb"),
@@ -143,11 +177,26 @@ export class ResultPipeline {
     pendingId?: string | null;
     detail?: Record<string, unknown>;
   }): Promise<void> {
-    const requestId = makeId("wb-result");
+    /*
+     * The delivery identity is derived only from durable facts, so it is the
+     * same string on every crash, restart and replay of this answer. The
+     * extension keys its injection idempotency on it, which is what keeps a
+     * recovery from putting the answer into ChatGPT a second time. It is also
+     * echoed back as `requestId` so the acknowledgement can be bound to the
+     * exact delivery that produced it.
+     */
+    const dispatchId = this.store.snapshot().currentTask?.dispatchId ?? null;
+    const deliveryId = deliveryIdFor({
+      taskId: input.taskId,
+      workbuddyMessageId: input.workbuddyMessageId,
+      dispatchId,
+    });
+    const requestId = deliveryId;
 
     await this.bridge.send({
       type: "send_to_chatgpt",
       requestId,
+      deliveryId,
       text: input.text,
       autoSend: this.config.relay.autoSendToChatGPT,
     });
@@ -158,6 +207,7 @@ export class ResultPipeline {
       ledgerEvent: "RESULT_DELIVERED",
       detail: {
         requestId,
+        deliveryId,
         via: "bridge",
         autoSend: this.config.relay.autoSendToChatGPT,
         ...(input.detail ?? {}),
@@ -168,6 +218,7 @@ export class ResultPipeline {
       if (state.currentTask?.taskId !== input.taskId) return;
       state.currentTask.status = "sent_to_gpt";
       state.currentTask.sentToGptAt = isoNow();
+      state.currentTask.deliveryId = deliveryId;
       state.state = "WAIT_GPT";
     });
 
@@ -184,6 +235,7 @@ export class ResultPipeline {
       taskId: input.taskId,
       workbuddyMessageId: input.workbuddyMessageId,
       requestId,
+      deliveryId,
       autoSend: this.config.relay.autoSendToChatGPT,
     });
   }

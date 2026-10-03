@@ -551,6 +551,8 @@ async function connect() {
             text: message.text,
             requestId:
               message.requestId || null,
+            deliveryId:
+              message.deliveryId || null,
             autoSend: Boolean(
               message.autoSend ??
               settingsNow.autoSendToChatGPT

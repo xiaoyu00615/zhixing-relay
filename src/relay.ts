@@ -534,7 +534,14 @@ export class ZhixingRelay {
      * holding a persisted answer - the plan names the one thing that is safe,
      * and a plan that names "listen" is never allowed to become "send again".
      */
-    const plan = planRecovery(task);
+    const hasPendingResult = task
+      ? this.store
+          .snapshot()
+          .pending.some(
+            (item) => item.kind === "workbuddy_result" && item.taskId === task.taskId,
+          )
+      : false;
+    const plan = planRecovery(task ? { ...task, hasPendingResult } : null);
 
     if (plan.kind === "resume_wait" && !this.workAbort) {
       /*
@@ -575,7 +582,97 @@ export class ZhixingRelay {
       return;
     }
 
+    if (plan.kind === "wait_ack") {
+      /*
+       * The answer was already handed to the extension (durable RESULT_DELIVERED
+       * / RESULT_ACKED evidence exists) but the round is still open. Re-delivering
+       * it would duplicate the message in ChatGPT, so the only safe move is to
+       * re-arm the lease and let the acknowledgement - or a thread observation -
+       * close the round. Nothing is re-sent, nothing is re-waited.
+       */
+      await this.store.mutate((state) => {
+        if (state.currentTask?.taskId === plan.taskId) {
+          state.state = "WAIT_GPT";
+        }
+      });
+      this.results.armLease(plan.taskId);
+      await this.audit.write("result_recovery_wait_ack", { taskId: plan.taskId });
+      return;
+    }
+
+    if (plan.kind === "redeliver_result") {
+      /*
+       * The durable outbox holds an answer that was received but never proven
+       * delivered. Re-deliver THAT answer - never re-run the task, never re-fetch
+       * it from WorkBuddy. The delivery identity is derived only from durable
+       * facts, so the sink's idempotency gate treats every replay of this answer
+       * as the same logical delivery and never injects it into ChatGPT twice.
+       *
+       * This is its own branch (not the generic `flushOnePending`) because the
+       * recovered round still owns a live `currentTask`: flushing the queue would
+       * refuse to deliver while that record stands, and the only thing that would
+       * otherwise clear it is the lease lapsing - far too slow, and it would drop
+       * the answer if the acknowledgement beat the timer.
+       */
+      this.scheduleWork(() => this.redeliverPendingResult(plan.taskId));
+      return;
+    }
+
     this.scheduleWork(() => this.flushOnePending());
+  }
+
+  /**
+   * Re-sends the persisted answer for a recovered task, exactly once.
+   *
+   * Called only from the `redeliver_result` recovery branch. It reads the
+   * durable outbox for the task and hands it to the extension via the normal
+   * delivery path, which keys on the stable `deliveryId` - so a crash that
+   * lands here a second time (or a later flush) sends the same logical
+   * delivery and is deduped by the sink. If the bridge is gone the outbox is
+   * left in place; the next reconnect re-delivers it.
+   */
+  private async redeliverPendingResult(taskId: string): Promise<void> {
+    const match = this.store
+      .snapshot()
+      .pending.find(
+        (item) => item.kind === "workbuddy_result" && item.taskId === taskId,
+      );
+
+    if (!match || match.kind !== "workbuddy_result") {
+      await this.audit.write("workbuddy_result_not_resent", {
+        taskId,
+        reason: "no durable outbox for the recovered task",
+      });
+      return;
+    }
+
+    if (!this.bridge.hasClient()) {
+      await this.audit.write("workbuddy_result_queued", {
+        taskId,
+        workbuddyMessageId: match.workbuddyMessageId,
+        reason: "Chrome bridge is disconnected",
+      });
+      return;
+    }
+
+    try {
+      await this.results.deliver({
+        taskId,
+        workbuddyMessageId: match.workbuddyMessageId,
+        text: match.text,
+        pendingId: match.id,
+      });
+    } catch (error) {
+      /*
+       * The persisted RESULT stays in the queue. The next flush re-delivers it
+       * to ChatGPT and never runs the WorkBuddy task again.
+       */
+      await this.audit.write("workbuddy_result_delivery_failed", {
+        taskId,
+        workbuddyMessageId: match.workbuddyMessageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -754,6 +851,9 @@ export class ZhixingRelay {
     await this.bridge.send({
       type: "send_to_chatgpt",
       requestId,
+      // Manual sends are not results and must never be idempotency-deduplicated
+      // against a recovered result delivery, so each carries its own id.
+      deliveryId: requestId,
       text,
       autoSend,
     });
@@ -830,6 +930,28 @@ export class ZhixingRelay {
            */
           const task = this.store.snapshot().currentTask;
           if (task?.status === "sent_to_gpt") {
+            /*
+             * Bind the acknowledgement to the delivery that produced it. A
+             * replayed or stray ack that names a different delivery cannot
+             * close the live round, because it does not belong to this send.
+             */
+            if (
+              message.requestId &&
+              task.deliveryId &&
+              message.requestId !== task.deliveryId
+            ) {
+              await this.audit.write("chatgpt_send_result_wrong_delivery", {
+                taskId: task.taskId,
+                expectedDeliveryId: task.deliveryId,
+                gotDeliveryId: message.requestId,
+              });
+              console.warn(
+                `[relay] ignoring chatgpt_send_result for ${task.taskId}: ` +
+                  `delivery id ${message.requestId} does not match ${task.deliveryId}`,
+              );
+              return;
+            }
+
             await this.noteStage({
               taskId: task.taskId,
               taskFingerprint: task.taskFingerprint ?? "*",
@@ -838,7 +960,7 @@ export class ZhixingRelay {
               stage: "RESULT_ACKED",
               ledgerEvent: "RESULT_ACKED",
               workbuddyMessageId: task.workbuddyOutboundMessageId ?? null,
-              resultId: message.requestId ?? null,
+              resultId: message.requestId ?? task.deliveryId ?? null,
               detail: { sent: message.sent ?? false, staged: message.staged ?? false },
             });
 
@@ -1402,6 +1524,15 @@ export class ZhixingRelay {
       }
     });
 
+    /*
+     * NOTE: the durable outbox for this result is NOT dropped here. A lease
+     * expiry means the acknowledgement never came, not that the answer was
+     * lost - it was already handed to the extension (RESULT_DELIVERED). Keeping
+     * the outbox lets a later flush re-deliver it safely; the stable delivery
+     * id keeps that replay from injecting the answer into ChatGPT twice. Only
+     * the acknowledgement path (completeCurrentRound) clears the outbox.
+     */
+
     this.noteTaskActivity();
 
     await this.audit.write("round_completed", {
@@ -1465,6 +1596,14 @@ export class ZhixingRelay {
         state.state = state.paused ? "PAUSED" : "IDLE";
       }
     });
+
+    /*
+     * The round that produced the answer is over, so the durable outbox for it
+     * is no longer needed. Dropping it here (not at delivery time) keeps the
+     * answer recoverable through the whole delivery window and lets a lease
+     * expiry re-deliver it safely rather than losing it.
+     */
+    await this.store.removePendingResultForTask(taskId);
 
     this.noteTaskActivity();
 

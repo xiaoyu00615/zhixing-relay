@@ -520,15 +520,134 @@ async function pressEnter(box) {
 
 
 
+/**
+ * Delivery idempotency.
+ *
+ * The Relay derives a stable `deliveryId` from durable facts (task, dispatch,
+ * WorkBuddy message) and sends it on every `send_to_chatgpt`. We remember which
+ * delivery ids we have already injected so that a Relay that re-sends the same
+ * delivery after a crash or restart cannot put the answer into ChatGPT a second
+ * time. Without this gate the only thing between a recovered round and a
+ * duplicate user message would be the Relay's own guess, and the Relay cannot
+ * know whether a crashed send actually landed.
+ */
+
+const DELIVERED_IDS_KEY = "zhixing_delivered_delivery_ids";
+const DELIVERED_IDS_CAP = 50;
+
+async function hasDeliveredId(
+  deliveryId
+) {
+
+  if (!deliveryId) return false;
+
+  try {
+
+    const stored =
+      await chrome.storage.local.get(
+        DELIVERED_IDS_KEY
+      );
+
+    const list =
+      Array.isArray(
+        stored[DELIVERED_IDS_KEY]
+      )
+        ? stored[DELIVERED_IDS_KEY]
+        : [];
+
+    return list.includes(
+      deliveryId
+    );
+
+  }
+  catch {
+
+    return false;
+
+  }
+
+}
+
+
+async function recordDeliveredId(
+  deliveryId
+) {
+
+  if (!deliveryId) return;
+
+  try {
+
+    const stored =
+      await chrome.storage.local.get(
+        DELIVERED_IDS_KEY
+      );
+
+    const list =
+      Array.isArray(
+        stored[DELIVERED_IDS_KEY]
+      )
+        ? stored[DELIVERED_IDS_KEY]
+        : [];
+
+    if (list.includes(deliveryId)) return;
+
+    const next =
+      [
+        ...list,
+        deliveryId
+      ].slice(
+        -DELIVERED_IDS_CAP
+      );
+
+    await chrome.storage.local.set(
+      {
+        [DELIVERED_IDS_KEY]: next
+      }
+    );
+
+  }
+  catch {
+
+    // Best effort: a dedupe miss is safer than throwing mid-send.
+
+  }
+
+}
+
+
 async function sendChatGPTMessage(
   text,
-  autoSend = true
+  autoSend = true,
+  deliveryId = null
 ) {
 
   console.log(
     "[Zhixing Relay] Sending:",
     text
   );
+
+
+  /*
+   * Idempotency gate. If this exact delivery was already injected we must not
+   * inject it again: a recovered Relay replaying the same delivery would
+   * otherwise create a second user message in the thread.
+   */
+  if (deliveryId && await hasDeliveredId(deliveryId)) {
+
+    console.log(
+      "[Zhixing Relay] delivery " +
+      deliveryId +
+      " already applied; skipping re-injection"
+    );
+
+    return {
+      ok: true,
+      sent: true,
+      staged: false,
+      alreadyDelivered: true
+    };
+
+  }
 
 
   const box =
@@ -622,6 +741,11 @@ async function sendChatGPTMessage(
     await sleep(400);
 
   }
+
+
+  // The answer is now in the composer (and sent, if autoSend): remember this
+  // delivery so a replay of the same delivery id cannot inject it twice.
+  await recordDeliveredId(deliveryId);
 
 
   return {
@@ -2067,7 +2191,8 @@ chrome.runtime.onMessage.addListener(
         message.text,
         Boolean(
           message.autoSend
-        )
+        ),
+        message.deliveryId ?? null
       )
       .then(
         result => {

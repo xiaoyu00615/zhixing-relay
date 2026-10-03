@@ -54,6 +54,13 @@ export type CurrentTask = {
    */
   sentToGptAt?: string;
   /**
+   * The stable identity of the delivery this round last issued for its result.
+   * Derived from durable facts at send time and echoed back by the extension as
+   * the acknowledgement's `requestId`, so a stray or replayed ack can be bound
+   * to the exact delivery that produced it - and ignored if it names another.
+   */
+  deliveryId?: string | undefined;
+  /**
    * Which model routed this turn, recorded so a restarted relay can rebuild
    * the task's pin from durable state. The router's own pin stays in memory -
    * this is only the fact needed to recreate it, not the pin itself.
@@ -148,6 +155,8 @@ export type RelayToExtension =
   | {
       type: "send_to_chatgpt";
       requestId: string;
+      /** Stable delivery identity; the extension idempotency-keys on it. */
+      deliveryId: string;
       text: string;
       autoSend: boolean;
     }
