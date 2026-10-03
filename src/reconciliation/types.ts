@@ -28,6 +28,7 @@ export type ReconciliationEventName =
   | "RESULT_RECEIVED"
   | "RESULT_DELIVERED"
   | "TASK_COMPLETED"
+  | "TASK_CANCELLED"
   | "TASK_REQUEUED"
   | "TASK_BLOCKED"
   | "INPUT_CONFIRM_FAILED"
@@ -53,6 +54,7 @@ export const RECONCILIATION_EVENTS: readonly ReconciliationEventName[] = [
   "RESULT_RECEIVED",
   "RESULT_DELIVERED",
   "TASK_COMPLETED",
+  "TASK_CANCELLED",
   "TASK_REQUEUED",
   "TASK_BLOCKED",
   "INPUT_CONFIRM_FAILED",

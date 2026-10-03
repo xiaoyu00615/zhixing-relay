@@ -1,4 +1,10 @@
 import { fingerprintShort, identityFingerprints, UNKNOWN_FINGERPRINT } from "./fingerprint.js";
+import {
+  hasProvenSend,
+  isClosingDisposition,
+  terminalStateFor,
+  type TerminalKind,
+} from "./terminal.js";
 import type { ReconciliationEvent, ReconciliationEventName } from "./types.js";
 
 /**
@@ -24,6 +30,8 @@ export type ReconciliationFindingKind =
   | "orphaned_task"
   // An operator closed this forgotten task instead of leaving it frozen.
   | "historical_task_closed"
+  // The task is terminal, and a runtime owner for it is still standing.
+  | "stale_terminal_owner"
   | "result_task_id_mismatch"
   | "resend_allowed"
   | "matched";
@@ -45,6 +53,10 @@ export type TaskState =
   | "dispatched"
   | "running"
   | "completed"
+  // The operator confirmed it never ran and terminated it.
+  | "cancelled"
+  // The operator closed it without a resend; it may or may not have run.
+  | "closed"
   | "blocked";
 
 export type TaskReconciliation = {
@@ -67,6 +79,14 @@ export type TaskReconciliation = {
   evidence: ReconciliationEventName[];
   state: TaskState;
   findings: ReconciliationFinding[];
+  /**
+   * The terminal decision for this task, when it has one.
+   *
+   * Read by the dispatch gate (a terminal task is never sent again) and by the
+   * startup owner cleanup (a terminal task must hold no runtime owner), so it is
+   * resolved once here rather than re-derived by each of them.
+   */
+  terminal: { kind: TerminalKind; seq: number; stands: boolean } | null;
   /** The ledger sequence of the operator closure, when one closes this task. */
   closedAtSeq: number | null;
   /** Safe to send again only after a human has been told what the state is. */
@@ -127,71 +147,13 @@ function emptyReport(reason: string, corruptLines: number): ReconciliationReport
 }
 
 /**
- * The evidence that WorkBuddy already has the task.
+ * Whether any of these events proves the task reached WorkBuddy.
  *
- * Anything in this list turns a retry into a duplicate: the relay cannot
- * prove the first send never ran, and a send that runs twice cannot be
- * undone. A requeue row from an older release says only that somebody
- * requeued - it is an error record, not proof either way - so it can never
- * outweigh a row that proves the send happened.
+ * Re-exported from the terminal policy, which owns the single list. A second
+ * copy of this list is a second policy, and two policies drift into disagreeing
+ * about the same task.
  */
-const PROVEN_SEND_EVIDENCE: readonly ReconciliationEventName[] = [
-  "SEND_CONFIRMED",
-  "RUNNING_CONFIRMED",
-  "RESULT_RECEIVED",
-  "RESULT_PERSISTED",
-  "RESULT_DELIVERED",
-  "RESULT_ACKED",
-  "TASK_COMPLETED",
-];
-
-export function hasProvenSend(evidence: readonly ReconciliationEventName[]): boolean {
-  return PROVEN_SEND_EVIDENCE.some((event) => evidence.includes(event));
-}
-
-/**
- * The events that say the task started or answered again.
- *
- * A closure settles the *history* it was written about. It cannot settle a
- * send that happens after it, so anything in this list that follows a
- * closure is judged on its own terms.
- */
-const EXECUTION_EVIDENCE: readonly ReconciliationEventName[] = [
-  "DISPATCH_STARTED",
-  "INPUT_CONFIRMED",
-  "SEND_CONFIRMED",
-  "RUNNING_CONFIRMED",
-  "RESULT_RECEIVED",
-  "RESULT_PERSISTED",
-  "RESULT_DELIVERED",
-  "RESULT_ACKED",
-  "TASK_COMPLETED",
-];
-
-/**
- * The dispositions an operator may write to close a task for good.
- *
- * A closure is the only way a task the relay has forgotten stops being a
- * blocker, and it has to name the kind of closure it is: "the work is done,
- * never send it again" is a different human decision from "drop it", and the
- * ledger keeps them apart on purpose.
- */
-export type HistoricalDisposition = "close_without_resend";
-
-export const HISTORICAL_DISPOSITIONS: readonly HistoricalDisposition[] = ["close_without_resend"];
-
-/**
- * Whether a ledger row is an operator closure.
- *
- * Read from the row's own detail rather than from the event name, because
- * `RECONCILIATION_RESOLVED` already means something else - lifting the hold
- * on a frozen live task - and the two decisions must not be interchangeable.
- */
-export function isClosingDisposition(detail: unknown): boolean {
-  if (!detail || typeof detail !== "object") return false;
-  const value = (detail as { disposition?: unknown }).disposition;
-  return typeof value === "string" && (HISTORICAL_DISPOSITIONS as readonly string[]).includes(value);
-}
+export { hasProvenSend, isClosingDisposition } from "./terminal.js";
 
 /** The closure that closes this chain, or null when there is none. */
 function lastClosure(events: readonly ReconciliationEvent[]): ReconciliationEvent | null {
@@ -262,9 +224,23 @@ export function reconcileTask(
    */
   const closure = lastClosure(events);
   const closedAtSeq = closure?.seq ?? null;
-  const afterClosure = closure === null ? [] : events.filter((event) => event.seq > closure.seq);
-  const ranAgainAfterClosure = afterClosure.some((event) => EXECUTION_EVIDENCE.includes(event.event));
-  const closedByOperator = closure !== null && !ranAgainAfterClosure;
+
+  /*
+   * The terminal decision, resolved once. It outranks everything the live
+   * state says: a task that has been cancelled or completed cannot be
+   * resurrected by a queue entry or a stale currentTask, and reading it here
+   * means the dispatch gate, the owner cleanup and this report all agree on
+   * one fact instead of each re-deriving it.
+   */
+  const terminal = terminalStateFor(events);
+  const terminalStands = terminal !== null && terminal.stands;
+
+  /*
+   * A task the relay no longer holds, which an operator has decided about.
+   * `COMPLETED` is excluded because a completed task was never a question: the
+   * ledger says the whole lifecycle finished, so there is no orphan to settle.
+   */
+  const closedByOperator = terminalStands ? terminal?.kind !== "COMPLETED" : false;
 
   const findings: ReconciliationFinding[] = [];
 
@@ -376,7 +352,11 @@ export function reconcileTask(
 
   if (findings.some((finding) => finding.kind === "identity_conflict") || has("TASK_BLOCKED")) {
     state = "blocked";
-  } else if (has("TASK_COMPLETED")) {
+  } else if (terminalStands && terminal?.kind === "CANCELLED") {
+    state = "cancelled";
+  } else if (terminalStands && terminal?.kind === "CLOSED_WITHOUT_RESEND") {
+    state = "closed";
+  } else if (has("TASK_COMPLETED") || (terminalStands && terminal?.kind === "COMPLETED")) {
     state = "completed";
   } else if (has("RESULT_RECEIVED") || has("RESULT_DELIVERED") || has("RUNNING_CONFIRMED")) {
     state = "running";
@@ -403,7 +383,29 @@ export function reconcileTask(
   const inFlight = context?.current ?? null;
   const inRelay = pending.includes(taskId) || inFlight === taskId;
 
-  if (inRelay === false && state !== "completed" && state !== "blocked" && has("TASK_PUBLISHED")) {
+  if (terminalStands && inRelay) {
+    /*
+     * The ledger says this task is over and the runtime still owns it. That is
+     * a crash between the terminal decision and the owner release - the window
+     * the terminal-first ordering exists to make survivable - so it is reported
+     * as what it is, and the relay's startup cleanup removes the owner. It is
+     * never an orphan: an orphan is a task nobody has decided about, and this
+     * one has been decided.
+     */
+    findings.push({
+      kind: "stale_terminal_owner",
+      severity: "info",
+      taskId,
+      dispatchId: null,
+      events: [terminal?.kind === "CANCELLED" ? "TASK_CANCELLED" : "TASK_COMPLETED"],
+      detail:
+        `task ${taskId} is terminal (${terminal?.kind} at seq ${terminal?.seq}) but the relay ` +
+        `still holds an owner for it (${inFlight === taskId ? "in flight" : "queued"}); ` +
+        `the stale owner is released without sending anything`,
+    });
+  }
+
+  if (inRelay === false && has("TASK_PUBLISHED")) {
     /*
      * Two different answers to the same question, and only a human can tell
      * them apart:
@@ -419,6 +421,10 @@ export function reconcileTask(
      * A closure never covers what happens after it: a send recorded after the
      * closure is judged on its own, so a later abnormal execution cannot be
      * hidden by an older decision.
+     *
+     * A cancellation settles the orphan the same way a close does, and for a
+     * stronger reason: the operator asserted the task never ran. Both are
+     * `info`, never blocking, because a decided task is not a lost one.
      */
     if (closedByOperator) {
       findings.push({
@@ -426,13 +432,19 @@ export function reconcileTask(
         severity: "info",
         taskId,
         dispatchId: null,
-        events: ["RECONCILIATION_RESOLVED"],
+        events: [terminal?.kind === "CANCELLED" ? "TASK_CANCELLED" : "RECONCILIATION_RESOLVED"],
         detail:
-          `task ${taskId} is not in the relay state, and an operator closed it at seq ${closedAtSeq} ` +
+          `task ${taskId} is not in the relay state, and an operator closed it at seq ${terminal?.seq} ` +
           `without it being resent; the old orphan is settled, the task stays out of the queue, and ` +
-          `nothing after seq ${closedAtSeq} is covered by this decision`,
+          `nothing after that decision is covered by it`,
       });
-    } else {
+    /*
+     * `closedByOperator` covers every terminal state except COMPLETED, and a
+     * completed task is already excluded by the state check - so a terminal
+     * task can never reach the orphan branch below. That is the precedence
+     * rule: a decided task is settled, not lost.
+     */
+    } else if (state !== "completed" && state !== "blocked") {
       findings.push({
         kind: "orphaned_task",
         severity: "blocking",
@@ -453,12 +465,16 @@ export function reconcileTask(
    * a duplicate send, and that is never allowed. The proof that beats a
    * requeue is any evidence that WorkBuddy got the task, so the old requeue
    * row from an earlier release cannot reopen a send that already happened -
-   * and a task an operator closed is not ours to send either.
+   * and a task an operator decided about is not ours to send either.
+   *
+   * A standing terminal decision is a fourth, independent veto: a cancelled or
+   * closed task is finished whatever the evidence says, so it is refused here
+   * even when nothing proves a send and a requeue row is sitting in the ledger.
    *
    * This boolean is the only answer to "may this task be sent again".
    */
   const mayResend =
-    !blocking && closure === null && has("TASK_REQUEUED") && !hasProvenSend(evidence);
+    !blocking && !terminalStands && has("TASK_REQUEUED") && !hasProvenSend(evidence);
 
   /*
    * The same fact, printed. It used to be computed a second time under a
@@ -501,6 +517,10 @@ export function reconcileTask(
     evidence,
     state,
     findings,
+    terminal:
+      terminal === null
+        ? null
+        : { kind: terminal.kind, seq: terminal.seq, stands: terminal.stands },
     closedAtSeq,
     mayResend,
   };

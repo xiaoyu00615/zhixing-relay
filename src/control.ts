@@ -58,6 +58,34 @@ export type RuntimeControl = {
     taskId: string;
     reason: string;
   }) => Promise<{ ok: boolean; message: string; blocked: boolean; findings: string[] }>;
+  /**
+   * Terminates one task that provably never ran.
+   *
+   * A third disposition, and the one that was missing: `resolve` lifts a hold,
+   * a historical close says "never send it again" about a task that may have
+   * run, and this one says "it never ran, stop it" about a task the relay is
+   * still holding unsent. It removes the queue entry that owns the task, so the
+   * three are not interchangeable and a cancellation cannot be reached through
+   * the older, more permissive routes.
+   *
+   * Required, and spelled with the relay's own canonical name, for the same
+   * reason `closeReconciledTaskWithoutResend` is: `src/index.ts` hands the whole
+   * `ZhixingRelay` to this transport, so an optional field is what lets a
+   * rename become a runtime 501 instead of a build error.
+   */
+  cancelUnsentTask: (input: {
+    taskId: string;
+    reason: string;
+  }) => Promise<{
+    ok: boolean;
+    message: string;
+    cancelled: boolean;
+    ownerRemoved: boolean;
+    removedIds: string[];
+    terminalEventSeq: number | null;
+    blocked: boolean;
+    findings: string[];
+  }>;
 };
 
 export const CONTROL_HOST = "127.0.0.1";
@@ -243,6 +271,49 @@ function routeFor(
         }
 
         const result = await control.closeReconciledTaskWithoutResend({ taskId, reason });
+        sendJson(res, result.ok ? 200 : 409, result);
+      };
+
+    /*
+     * The cancellation, deliberately its own route rather than another value
+     * of `disposition` on the close above.
+     *
+     * A close says "never send it again" and works on a task that may already
+     * have run; a cancellation says "it never ran" and removes the queue entry
+     * that owns the task. Folding the second into the first would let a single
+     * parameter decide both what is asserted about the world and whether a
+     * runtime owner is deleted - so the two stay apart, and this one refuses
+     * anything it cannot name exactly.
+     */
+    case "/control/reconciliation/cancel":
+      return async (_req, res) => {
+        const url = new URL(_req.url ?? "/", `http://${CONTROL_HOST}`);
+        const taskId = (url.searchParams.get("taskId") ?? "").trim();
+        const reason = (url.searchParams.get("reason") ?? "").trim();
+
+        if (taskId.length === 0) {
+          sendJson(res, 409, {
+            ok: false,
+            error: "a cancellation needs the task it cancels (taskId is required)",
+          });
+          return;
+        }
+
+        /*
+         * A cancellation is a durable claim that a task never ran, so it is not
+         * issued on a default reason. An unnamed reason would leave a terminal
+         * row in the ledger that says only that somebody stopped something,
+         * which is exactly the kind of row nobody can act on later.
+         */
+        if (reason.length === 0) {
+          sendJson(res, 409, {
+            ok: false,
+            error: "a cancellation needs a reason (reason is required)",
+          });
+          return;
+        }
+
+        const result = await control.cancelUnsentTask({ taskId, reason });
         sendJson(res, result.ok ? 200 : 409, result);
       };
 

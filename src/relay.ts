@@ -21,6 +21,7 @@ import type { ModelRouter } from "./model-router/router.js";
 import { browserFingerprint, isoNow, makeId } from "./utils.js";
 import { WorkBuddyClient } from "./workbuddy.js";
 import {
+  cancelEligibility,
   decideDispatch,
   dispatchIdFor,
   ReconciliationService,
@@ -245,6 +246,15 @@ export class ZhixingRelay {
     if (this.reconciliation) {
       this.ledgerEventCount = await this.reconciliation.ledgerLength();
     }
+
+    /*
+     * Repair stale owners before reading the ledger for the operator: the
+     * terminal decisions are written before the runtime owners are released, so
+     * a crash in that window leaves an owner this call can identify from the
+     * ledger alone. Doing it first means the report below describes the
+     * repaired relay rather than a list of owners a human has to interpret.
+     */
+    await this.releaseTerminalOwners("startup");
 
     await this.runReconciliation("startup");
   }
@@ -1514,6 +1524,30 @@ export class ZhixingRelay {
 
     if (!task || task.taskId !== taskId) return false;
 
+    /*
+     * DURABLE TERMINAL EVIDENCE FIRST, LIVE OWNER RELEASE SECOND.
+     *
+     * The order is the whole point. Releasing the owner first and writing
+     * TASK_COMPLETED afterwards leaves a window in which a crash leaves a task
+     * the ledger says produced a result, that nothing owns, and that was never
+     * recorded as finished - which reconciliation then reads as a lost task
+     * and freezes scheduling over work that is already done. Writing the
+     * terminal row first inverts the risk: a crash now leaves a stale owner for
+     * a finished task, which is a fact with an obvious repair (`init` releases
+     * owners whose task is terminal) rather than a task that vanished.
+     */
+    await this.noteStage({
+      taskId,
+      taskFingerprint: task.taskFingerprint ?? "*",
+      dispatchId: task.dispatchId ?? null,
+      attempt: task.attempt ?? null,
+      execution: task.execution ?? null,
+      stage: "COMPLETED",
+      ledgerEvent: "TASK_COMPLETED",
+      workbuddyMessageId: task.workbuddyOutboundMessageId ?? null,
+      detail: { reason },
+    });
+
     await this.store.mutate((state) => {
       if (state.currentTask?.taskId !== taskId) return;
 
@@ -1539,24 +1573,6 @@ export class ZhixingRelay {
       taskId,
       releasedAt: isoNow(),
       reason,
-    });
-
-    /*
-     * COMPLETED is the last stage, and reaching it is what makes the whole
-     * chain readable: RESULT_RECEIVED, RESULT_PERSISTED, RESULT_DELIVERED and
-     * RESULT_ACKED were all accepted before, in that order.
-     */
-    await this.noteStage({
-      taskId,
-      taskFingerprint: task?.taskFingerprint ?? "*",
-      dispatchId: task?.dispatchId ?? null,
-      attempt: task?.attempt ?? null,
-      // The record is already cleared, so the stage to move from is handed in.
-      execution: task?.execution ?? null,
-      stage: "COMPLETED",
-      ledgerEvent: "TASK_COMPLETED",
-      workbuddyMessageId: task?.workbuddyOutboundMessageId ?? null,
-      detail: { reason },
     });
 
     console.log(`[relay] round ${taskId} completed (${reason})`);
@@ -1587,14 +1603,26 @@ export class ZhixingRelay {
 
     if (!task || task.taskId !== taskId) return false;
 
-    await this.store.mutate((state) => {
-      if (state.currentTask?.taskId !== taskId) return;
-
-      state.currentTask = null;
-
-      if (state.state === "WAIT_GPT" || state.state === "WAIT_WORKBUDDY") {
-        state.state = state.paused ? "PAUSED" : "IDLE";
-      }
+    /*
+     * Durable terminal evidence first, live owner release second - the same
+     * ordering `finishRound` uses, and for the same reason. The round's
+     * completion is a fact about the world that survives this process; the
+     * `currentTask` record is a runtime convenience that does not. Writing the
+     * one that is durable before clearing the one that is not means a crash in
+     * between leaves a repairable stale owner instead of a task the ledger
+     * cannot explain, which is what used to freeze a production relay over a
+     * round that had in fact finished.
+     */
+    await this.noteStage({
+      taskId,
+      taskFingerprint: task.taskFingerprint ?? "*",
+      dispatchId: task.dispatchId ?? null,
+      attempt: task.attempt ?? null,
+      execution: task.execution ?? null,
+      stage: "COMPLETED",
+      ledgerEvent: "TASK_COMPLETED",
+      workbuddyMessageId: task.workbuddyOutboundMessageId ?? null,
+      detail: { reason },
     });
 
     /*
@@ -1605,30 +1633,22 @@ export class ZhixingRelay {
      */
     await this.store.removePendingResultForTask(taskId);
 
+    await this.store.mutate((state) => {
+      if (state.currentTask?.taskId !== taskId) return;
+
+      state.currentTask = null;
+
+      if (state.state === "WAIT_GPT" || state.state === "WAIT_WORKBUDDY") {
+        state.state = state.paused ? "PAUSED" : "IDLE";
+      }
+    });
+
     this.noteTaskActivity();
 
     await this.audit.write("round_completed", {
       taskId,
       releasedAt: isoNow(),
       reason,
-    });
-
-    /*
-     * COMPLETED is the last stage, and reaching it is what makes the whole
-     * chain readable: RESULT_RECEIVED, RESULT_PERSISTED, RESULT_DELIVERED and
-     * RESULT_ACKED were all accepted before, in that order.
-     */
-    await this.noteStage({
-      taskId,
-      taskFingerprint: task?.taskFingerprint ?? "*",
-      dispatchId: task?.dispatchId ?? null,
-      attempt: task?.attempt ?? null,
-      // The record is already cleared, so the stage to move from is handed in.
-      execution: task?.execution ?? null,
-      stage: "COMPLETED",
-      ledgerEvent: "TASK_COMPLETED",
-      workbuddyMessageId: task?.workbuddyOutboundMessageId ?? null,
-      detail: { reason },
     });
 
     console.log(`[relay] round ${taskId} completed (${reason})`);
@@ -1756,6 +1776,16 @@ export class ZhixingRelay {
       this.noteLedgerWrite();
     }
 
+    /*
+     * Exactly one TASK_REQUEUED per logical requeue.
+     *
+     * This row used to be written twice, differing only in a `via` detail key.
+     * That is not a harmless duplicate: a chain with two requeue rows reads as
+     * two requeues to anything counting evidence, and the second row says the
+     * task was put back on the queue twice when it was put back once. The
+     * queue itself is recorded separately, by `recordTaskEnqueued` above, which
+     * is a different fact and stays.
+     */
     await this.recordEvidence({
       event: "TASK_REQUEUED",
       taskId: args.taskId,
@@ -1763,15 +1793,6 @@ export class ZhixingRelay {
       attempt: requeued?.attempt ?? null,
       dispatchId: requeued?.dispatchId ?? null,
       detail: { retryCount, reason: args.reason, via: "requeue" },
-    });
-
-    await this.recordEvidence({
-      event: "TASK_REQUEUED",
-      taskId: args.taskId,
-      taskFingerprint: requeued?.taskFingerprint ?? "*",
-      attempt: requeued?.attempt ?? null,
-      dispatchId: requeued?.dispatchId ?? null,
-      detail: { retryCount, reason: args.reason },
     });
 
     console.warn(
@@ -2102,6 +2123,312 @@ export class ZhixingRelay {
       pending: snapshot.pending.map((item) => item.taskId).filter((id): id is string => typeof id === "string"),
       current: snapshot.currentTask?.taskId ?? null,
     };
+  }
+
+  /**
+   * The queue entries that own one task, with the identity each one names.
+   *
+   * A queue entry does not reliably carry a task id: a task accepted straight
+   * from the GPT page is stored as the envelope text alone, because that text
+   * is the only thing the intake path is given. So the owner is recognised the
+   * way it was created - by reading the envelope back out of the text - and the
+   * fingerprint that comes with it is the real one, not a placeholder.
+   *
+   * This is the step that lets a disposition name an *exact* task. Guessing
+   * here is what would make a cancellation able to delete somebody else's work.
+   */
+  private pendingOwnersFor(taskId: string): {
+    ids: string[];
+    fingerprints: string[];
+    sourceFingerprints: (string | null)[];
+  } {
+    const ids: string[] = [];
+    const fingerprints: string[] = [];
+    const sourceFingerprints: (string | null)[] = [];
+
+    for (const item of this.store.snapshot().pending) {
+      if (item.kind !== "gpt_task") continue;
+
+      const intent = readRelayIntent(item.text);
+
+      /*
+       * Either the entry names the task directly, or its text does. The text
+       * is parsed rather than string-matched, because only the parser knows
+       * which part of a message is the envelope - a task id quoted inside a
+       * prose answer is not an owner of anything.
+       */
+      const ownsIt =
+        (item.taskId !== undefined && item.taskId === taskId) ||
+        (intent.kind === "task" && intent.task.taskId === taskId);
+
+      if (!ownsIt) continue;
+
+      const fingerprint =
+        item.taskFingerprint ??
+        (intent.kind === "task" && intent.task.block !== null
+          ? taskFingerprint(intent.task.block)
+          : null);
+
+      // An owner whose identity cannot be established is not acted upon.
+      if (fingerprint === null) continue;
+
+      ids.push(item.id);
+      fingerprints.push(fingerprint);
+      // The GPT message the task arrived on: half of the durable identity, and
+      // the reason the terminal row can be checked against a later arrival.
+      sourceFingerprints.push(item.fingerprint);
+    }
+
+    return { ids, fingerprints, sourceFingerprints };
+  }
+
+  /**
+   * Terminates a task that provably never ran.
+   *
+   * This is the disposition for the task the relay has queued but never sent -
+   * the shape a task refused before send is left in, and the shape the
+   * production smoke task is in today. The operator states that nothing
+   * executed, and from that moment the task is finished: it is not pending, it
+   * is not retryable, and no redisplay on the GPT page, extension reconnect,
+   * restart or manual replay can put it back in front of WorkBuddy.
+   *
+   * The ordering is deliberate and is the whole crash-safety argument:
+   *
+   *   1. eligibility, from the ledger alone - a task with any execution
+   *      evidence is refused here and must be closed without a resend instead,
+   *      because "may have run" and "never ran" are different claims;
+   *   2. the durable terminal row, naming the exact envelope;
+   *   3. only then the removal of the queue entry that owned it.
+   *
+   * Terminal evidence before owner cleanup means a crash between 2 and 3
+   * leaves a *stale* owner for a decided task, which the next start releases
+   * without sending anything. The reverse order would leave a task with no
+   * owner and no decision - silently gone, with nothing to reconcile against.
+   */
+  async cancelUnsentTask(input: { taskId: string; reason: string }): Promise<{
+    ok: boolean;
+    message: string;
+    cancelled: boolean;
+    ownerRemoved: boolean;
+    removedIds: string[];
+    terminalEventSeq: number | null;
+    blocked: boolean;
+    findings: string[];
+  }> {
+    const taskId = input.taskId.trim();
+
+    const refuse = (message: string): ReturnType<ZhixingRelay["cancelUnsentTask"]> =>
+      Promise.resolve({
+        ok: false,
+        message,
+        cancelled: false,
+        ownerRemoved: false,
+        removedIds: [],
+        terminalEventSeq: null,
+        blocked: this.reconciliationHold,
+        findings: [],
+      });
+
+    if (taskId.length === 0) {
+      return refuse("a cancellation needs the task it cancels (taskId is required)");
+    }
+
+    if (!this.reconciliation) {
+      return refuse("the relay has no ledger, so there is nothing to cancel");
+    }
+
+    /*
+     * A cancellation is a claim about a task that never ran, so it can only be
+     * made about a task the relay still owns as a queue entry. The live record
+     * is excluded on purpose: that is a round in flight, and the operator
+     * disposition for one is a close, not a cancellation.
+     */
+    const live = this.store.snapshot().currentTask;
+    if (live !== null && live.taskId === taskId) {
+      return refuse(
+        `task ${taskId} is the live round (stage ${live.execution?.stage ?? "none"}), not a queued ` +
+          `task; a task that may have been sent is closed without a resend, not cancelled`,
+      );
+    }
+
+    const owners = this.pendingOwnersFor(taskId);
+
+    if (owners.ids.length === 0) {
+      return refuse(
+        `no queued task named ${taskId} owns anything, so there is nothing to cancel; ` +
+          `a cancellation only applies to a task the relay is holding unsent`,
+      );
+    }
+
+    /*
+     * More than one entry for one task is two owners, and "which one does the
+     * operator mean" has no safe answer. Refusing is the fail-closed choice.
+     */
+    if (owners.ids.length > 1) {
+      return refuse(
+        `task ${taskId} is on the queue ${owners.ids.length} times; refusing to guess which ` +
+          `owner to cancel`,
+      );
+    }
+
+    const [fingerprint] = owners.fingerprints;
+    if (fingerprint === undefined) {
+      return refuse(`the queue entry for ${taskId} names no envelope, so it cannot be cancelled`);
+    }
+
+    const history = await this.reconciliation.getTaskHistory(taskId);
+    const eligibility = cancelEligibility(history, fingerprint);
+
+    if (!eligibility.ok) {
+      return refuse(eligibility.detail);
+    }
+
+    /*
+     * Step 1 done: this task is provably unsent and unaccounted for. Write the
+     * durable terminal decision naming its exact identity, before touching the
+     * queue - so a crash from here on leaves a repairable stale owner rather
+     * than an unowned task.
+     */
+    const cancelled = await this.reconciliation.recordTaskCancelled({
+      taskId,
+      taskFingerprint: fingerprint,
+      messageFingerprint: owners.sourceFingerprints[0] ?? null,
+      reason: input.reason,
+      source: "control",
+      detail: { removedPendingIds: owners.ids },
+    });
+
+    if (!cancelled.ok) {
+      return refuse(cancelled.message);
+    }
+
+    this.noteLedgerWrite();
+
+    await this.audit.write("task_cancelled", {
+      taskId,
+      taskFingerprint: fingerprint,
+      reason: input.reason,
+      terminalEventSeq: cancelled.event.seq,
+      releasedPendingIds: owners.ids,
+    });
+
+    /*
+     * Step 2: the owner goes. The terminal row is already durable, so a crash
+     * between the two is survivable - and the entry that survives it is
+     * removed by `releaseTerminalOwners` on the next start, still without a
+     * dispatch.
+     */
+    const removedIds = await this.store.removePendingByIds(owners.ids);
+
+    const report = await this.runReconciliation(`cancelled unsent: ${input.reason}`);
+    const blocking =
+      report?.findings
+        .filter((finding) => finding.severity === "blocking")
+        .map((finding) => `${finding.kind}:${finding.taskId}`) ?? [];
+
+    console.warn(
+      `[relay] task ${taskId} cancelled as unsent (seq ${cancelled.event.seq}); ` +
+        `${removedIds.length} queue owner(s) released, nothing was sent`,
+    );
+
+    return {
+      ok: true,
+      cancelled: true,
+      ownerRemoved: removedIds.length > 0,
+      removedIds,
+      terminalEventSeq: cancelled.event.seq,
+      message:
+        removedIds.length > 0
+          ? `task ${taskId} was confirmed unsent and is terminated; its queue owner was released and it will never be executed`
+          : `task ${taskId} was confirmed unsent and is terminated; it will never be executed`,
+      blocked: this.reconciliationHold,
+      findings: blocking,
+    };
+  }
+
+  /**
+   * Releases runtime owners for tasks the ledger has already closed.
+   *
+   * The terminal-first ordering in `cancelUnsentTask`, `completeCurrentRound`
+   * and `finishRound` means a crash can leave the durable decision written and
+   * the runtime owner still standing: a queue entry for a cancelled task, a
+   * `currentTask` for a completed one. Both are the same repair, and both are
+   * safe to make from the ledger alone - a terminal task is never dispatched
+   * again, so removing its owner cannot lose work, it only stops a finished
+   * task from occupying the relay.
+   *
+   * It runs at start-up, before the reconciliation whose findings describe the
+   * state, so the report an operator reads is the repaired one rather than a
+   * list of stale owners they have to interpret themselves.
+   */
+  private async releaseTerminalOwners(reason: string): Promise<void> {
+    if (!this.reconciliation) return;
+
+    const { report } = await this.reconciliation.reconcile(
+      `terminal owner cleanup: ${reason}`,
+      this.liveReconciliationContext(),
+    );
+
+    for (const task of report.tasks) {
+      if (task.terminal === null || !task.terminal.stands) continue;
+
+      const live = this.store.snapshot().currentTask;
+
+      if (live !== null && live.taskId === task.taskId) {
+        await this.store.mutate((state) => {
+          if (state.currentTask?.taskId !== task.taskId) return;
+          state.currentTask = null;
+          if (state.state !== "PAUSED" && state.state !== "STOPPED") state.state = "IDLE";
+        });
+
+        await this.audit.write("terminal_owner_released", {
+          taskId: task.taskId,
+          terminal: task.terminal.kind,
+          terminalSeq: task.terminal.seq,
+          owner: "currentTask",
+          reason,
+        });
+
+        console.warn(
+          `[relay] released the live record for ${task.taskId}: the ledger already holds ` +
+            `${task.terminal.kind} at seq ${task.terminal.seq}`,
+        );
+      }
+
+      const owners = this.pendingOwnersFor(task.taskId);
+      if (owners.ids.length === 0) continue;
+
+      /*
+       * Only entries whose envelope matches the terminal decision are removed.
+       * An entry naming a *different* envelope under the same taskId is a
+       * contradiction, not this task's leftover, and deleting it would be the
+       * relay quietly destroying a task it has never been asked about.
+       */
+      const removable = owners.ids.filter((_, index) => {
+        const candidate = owners.fingerprints[index];
+        return candidate === task.fingerprint || task.identities.length === 0;
+      });
+
+      if (removable.length === 0) continue;
+
+      const removed = await this.store.removePendingByIds(removable);
+
+      if (removed.length === 0) continue;
+
+      await this.audit.write("terminal_owner_released", {
+        taskId: task.taskId,
+        terminal: task.terminal.kind,
+        terminalSeq: task.terminal.seq,
+        owner: "pending",
+        removedIds: removed,
+        reason,
+      });
+
+      console.warn(
+        `[relay] released ${removed.length} stale queue owner(s) for ${task.taskId}: the ledger ` +
+          `already holds ${task.terminal.kind} at seq ${task.terminal.seq}; nothing was sent`,
+      );
+    }
   }
 
   /**

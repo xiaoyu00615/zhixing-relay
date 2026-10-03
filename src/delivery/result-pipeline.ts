@@ -81,6 +81,23 @@ export class ResultPipeline {
   private readonly hooks: ResultPipelineHooks;
   /** One entry per RESULT accepted in this process, never per restart. */
   private readonly claimed = new ResultDeliveryLedger();
+  /**
+   * The deliveries happening right now, by result identity.
+   *
+   * The durable outbox entry is removed *after* the send, so a window exists in
+   * which two callers can pick up the same answer - a recovery re-delivering it
+   * while a queue flush is walking the same entry. Both would then hand the
+   * same text to the extension, which the sink dedupes by delivery id, so the
+   * user would not see it twice; but the relay would have delivered it twice,
+   * and "delivered once" is a claim this module should be able to make
+   * honestly rather than lean on the sink for.
+   *
+   * Deliberately *in flight* rather than "already sent": a replay that is
+   * awaited and then retried is the crash-recovery case and must still be
+   * delivered, while a second caller arriving while the first is still sending
+   * is the duplicate this set exists to suppress.
+   */
+  private readonly inFlight = new Set<string>();
   private lease: { taskId: string; timer: ReturnType<typeof setTimeout> } | null = null;
 
   constructor(options: ResultPipelineOptions) {
@@ -171,6 +188,36 @@ export class ResultPipeline {
    * task stays in the queue owner's hands and holds a lease.
    */
   async deliver(input: {
+    taskId: string;
+    workbuddyMessageId: string;
+    text: string;
+    pendingId?: string | null;
+    detail?: Record<string, unknown>;
+  }): Promise<void> {
+    /*
+     * One delivery at a time per answer. A recovery re-delivering a persisted
+     * result and a queue flush walking the same outbox entry are two owners of
+     * one answer, and the outbox cannot tell them apart - the entry only leaves
+     * the queue after the send. The second one to arrive waits its turn rather
+     * than sending the same text again.
+     */
+    const flightKey = resultDeliveryKey({
+      taskId: input.taskId,
+      workbuddyMessageId: input.workbuddyMessageId,
+      dispatchId: this.store.snapshot().currentTask?.dispatchId ?? null,
+    });
+
+    if (this.inFlight.has(flightKey)) return;
+    this.inFlight.add(flightKey);
+
+    try {
+      await this.deliverOnce(input);
+    } finally {
+      this.inFlight.delete(flightKey);
+    }
+  }
+
+  private async deliverOnce(input: {
     taskId: string;
     workbuddyMessageId: string;
     text: string;

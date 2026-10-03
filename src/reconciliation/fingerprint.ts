@@ -80,6 +80,27 @@ export function identityFingerprints(fingerprints: readonly (string | null | und
   return seen;
 }
 
+/*
+ * NOT unified into one helper on purpose (deferred to a later slice).
+ *
+ * "Is this the same envelope?" is asked twice, with two different meanings, and
+ * the two answers are deliberately different:
+ *
+ *   publishing  may this envelope be RECORDED at all? A taskId already carried
+ *               under a different envelope is a reuse of the name, so it is
+ *               refused and the refusal is written down.
+ *   dispatch    may this be SENT? A request whose fingerprint does not match
+ *               the single accepted one is refused by the source proof, which
+ *               names the mismatch (`task_fingerprint_mismatch`), not as a
+ *               contradiction.
+ *
+ * Collapsing them would turn a proof mismatch into an identity conflict and
+ * change a refusal reason that operators read; `test/reconciliation.test.ts`
+ * pins the difference on purpose. The shared primitive is
+ * `identityFingerprints` above, and both callers already use it, so the
+ * *definition* of "which fingerprints name a task" is already single.
+ */
+
 /**
  * The dispatch id for one attempt at one task.
  *

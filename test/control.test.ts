@@ -60,6 +60,16 @@ let control: {
     blocked: boolean;
     findings: string[];
   }>;
+  cancelUnsentTask: (input: { taskId: string; reason: string }) => Promise<{
+    ok: boolean;
+    message: string;
+    cancelled: boolean;
+    ownerRemoved: boolean;
+    removedIds: string[];
+    terminalEventSeq: number | null;
+    blocked: boolean;
+    findings: string[];
+  }>;
 };
 
 function fakeAudit(): AuditLog {
@@ -155,6 +165,10 @@ beforeEach(async () => {
     closeReconciledTaskWithoutResend: (input) => {
       calls.push(`close:${input.taskId}`);
       return inner.closeReconciledTaskWithoutResend(input);
+    },
+    cancelUnsentTask: (input) => {
+      calls.push(`cancel:${input.taskId}`);
+      return inner.cancelUnsentTask(input);
     },
   };
 

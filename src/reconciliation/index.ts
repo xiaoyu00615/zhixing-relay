@@ -1,4 +1,4 @@
-import { identityFingerprints, UNKNOWN_FINGERPRINT } from "./fingerprint.js";
+import { identityFingerprints, isConcreteTaskFingerprint, UNKNOWN_FINGERPRINT } from "./fingerprint.js";
 import { TaskLedger } from "./ledger.js";
 import { reconcile } from "./reconcile.js";
 import type { ReconciliationLiveContext } from "./reconcile.js";
@@ -16,6 +16,7 @@ export type CloseTaskResult =
 export { TaskLedger, defaultLedgerUrl } from "./ledger.js";
 export * from "./fingerprint.js";
 export * from "./reconcile.js";
+export * from "./terminal.js";
 export type * from "./decision.js";
 export { decideDispatch } from "./decision.js";
 export * from "./source-proof.js";
@@ -53,6 +54,11 @@ export class ReconciliationService {
      * already holds bookkeeping under the placeholder - which is what an older
      * requeue or a resolution wrote - is not a second envelope, so publishing
      * the real work underneath it is the normal thing, not a contradiction.
+     *
+     * This asks a different question from the one `decideDispatch` asks, and
+     * the difference is deliberate - see the note in `fingerprint.ts`. Here a
+     * taskId already carried under a different envelope is a *reuse of the
+     * name*, and it is refused with the refusal written down.
      */
     const prior = identityFingerprints(history.map((event) => event.taskFingerprint));
     const conflict = prior.find((fingerprint) => fingerprint !== input.taskFingerprint);
@@ -207,6 +213,7 @@ export class ReconciliationService {
       | "RUNNING_CONFIRM_TIMEOUT"
       | "DISPATCH_STALLED"
       | "TASK_COMPLETED"
+      | "TASK_CANCELLED"
       | "TASK_REQUEUED"
       | "TASK_BLOCKED"
     >;
@@ -258,13 +265,77 @@ export class ReconciliationService {
     const event = await this.ledger.append({
       event: "RECONCILIATION_RESOLVED",
       taskId,
-      // Bookkeeping: the row closes a task, it does not name an envelope.
+      // Bookkeeping: the row closes a task, it does not name an envelope. A
+      // cancellation is the opposite and names its envelope exactly - see
+      // recordTaskCancelled - which is why the two closures differ here.
       taskFingerprint: UNKNOWN_FINGERPRINT,
       source: input.source ?? "control",
       detail: {
         disposition: "close_without_resend",
         reason: input.reason,
         taskId,
+      },
+    });
+
+    return { ok: true, event };
+  }
+
+  /**
+   * Records that a task was confirmed never to have run, and is now terminated.
+   *
+   * This is the disposition for a task the relay never sent: the operator has
+   * established that nothing executed, so the task is finished rather than
+   * pending, and no future intake, reconnect, restart or replay may run it.
+   *
+   * The row carries the **exact identity** of the task it terminates - the
+   * task id, the fingerprint of the envelope, and the fingerprint of the GPT
+   * message behind it. That is what makes it a durable terminal identity rather
+   * than a footnote: a later arrival of the same envelope is refused by
+   * comparing these fields, and an arrival carrying a *different* envelope is
+   * still a contradiction rather than quietly inheriting this decision.
+   *
+   * It is a new row, like every other decision here. Nothing is deleted,
+   * rewritten, requeued or dispatched, and no completion is invented for work
+   * that never happened - `TASK_CANCELLED` says the opposite of
+   * `TASK_COMPLETED`, and writing the latter here would be a lie about
+   * WorkBuddy.
+   */
+  async recordTaskCancelled(input: {
+    taskId: string;
+    /** The envelope fingerprint; must be concrete, never the placeholder. */
+    taskFingerprint: string;
+    messageFingerprint?: string | null;
+    reason: string;
+    source?: ReconciliationSource;
+    /** The queue entries that owned this task, for the audit trail. */
+    detail?: Record<string, unknown> | null;
+  }): Promise<CloseTaskResult> {
+    const taskId = input.taskId.trim();
+
+    if (taskId.length === 0) {
+      return { ok: false, message: "a cancellation needs the task it cancels" };
+    }
+
+    if (!isConcreteTaskFingerprint(input.taskFingerprint)) {
+      return {
+        ok: false,
+        message:
+          `a cancellation must name the exact envelope it terminates; ` +
+          `${JSON.stringify(input.taskFingerprint)} names no task`,
+      };
+    }
+
+    const event = await this.ledger.append({
+      event: "TASK_CANCELLED",
+      taskId,
+      taskFingerprint: input.taskFingerprint,
+      source: input.source ?? "control",
+      messageFingerprint: input.messageFingerprint ?? null,
+      detail: {
+        disposition: "cancel_unsent",
+        reason: input.reason,
+        taskId,
+        ...(input.detail ?? {}),
       },
     });
 

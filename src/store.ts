@@ -136,6 +136,32 @@ export class RelayStore {
   }
 
   /**
+   * Drops the queued entries that own one task, by id.
+   *
+   * Used by the operator cancellation, which has to remove the *exact* owner of
+   * a task it decided about. Ids are named rather than matched on `taskId`,
+   * because a queue entry does not always carry one: a task accepted straight
+   * from the GPT page is stored as the envelope text alone, and its identity has
+   * to be recovered from that text before the entry can be recognised. Deciding
+   * which entries those are belongs to the relay, which owns the protocol; this
+   * only carries out the removal it was handed, so the two halves cannot
+   * disagree about what was removed.
+   */
+  async removePendingByIds(ids: readonly string[]): Promise<string[]> {
+    if (ids.length === 0) return [];
+
+    const dropping = new Set(ids);
+    let removed: string[] = [];
+
+    await this.mutate((state) => {
+      removed = state.pending.filter((item) => dropping.has(item.id)).map((item) => item.id);
+      state.pending = state.pending.filter((item) => !dropping.has(item.id));
+    });
+
+    return removed;
+  }
+
+  /**
    * Drops one queued item, by id.
    *
    * The only caller is a RESULT that ChatGPT acknowledged: the durable copy of

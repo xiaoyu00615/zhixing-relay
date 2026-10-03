@@ -1,5 +1,6 @@
 import { dispatchIdFor, identityFingerprints } from "./fingerprint.js";
 import { durableSourceProof } from "./source-proof.js";
+import { hasProvenSend, terminalStateFor } from "./terminal.js";
 import type { ReconciliationEvent } from "./types.js";
 
 /**
@@ -14,6 +15,8 @@ import type { ReconciliationEvent } from "./types.js";
 
 export type DispatchBlockedReason =
   | "identity_conflict"
+  | "terminal_cancelled"
+  | "terminal_closed"
   | "already_completed"
   | "already_running"
   | "send_confirmed"
@@ -71,12 +74,16 @@ export function decideDispatch(
    * First question, always: is this even the same task as the one on record?
    * A second envelope with the same name is a contradiction, and no amount of
    * helpfulness makes a contradiction schedulable.
-   */
-  /*
+   *
    * Only fingerprints that name the task can contradict each other. A requeue
    * or a resolution written without an envelope to point at carries the
    * placeholder, and counting that placeholder as a second envelope is how a
    * healthy chain reads as "published twice with different content".
+   *
+   * Note this is a *different question* from the one `recordTaskPublished`
+   * asks, on purpose - see the note in `fingerprint.ts`. A request that carries
+   * a fingerprint the chain never accepted is not a contradiction here; it falls
+   * through to the source proof below, which names the mismatch.
    */
   const fingerprints = identityFingerprints(history.map((item) => item.taskFingerprint));
   if (fingerprints.length > 1 && fingerprints.includes(request.taskFingerprint)) {
@@ -85,6 +92,44 @@ export function decideDispatch(
       reason: "identity_conflict",
       detail: `task ${taskId} was published twice with different envelopes`,
     };
+  }
+
+  /*
+   * Second question: has this task already ended?
+   *
+   * A terminal decision outranks every runtime fact, which is the whole reason
+   * it is read here and not merely in the reconciler. A cancelled task that
+   * reappears - the GPT page redisplaying the envelope, an extension reconnect
+   * replaying it, a queue entry surviving a restart - is refused by name, so
+   * "the page showed it again" can never become "so run it again".
+   *
+   * Cancellation is named separately from a close because the two are different
+   * claims: one asserts the task never ran, the other only that it will not be
+   * sent again. Both refuse the dispatch; only one of them says the work is
+   * still outstanding somewhere.
+   */
+  const terminal = terminalStateFor(history);
+
+  if (terminal !== null && terminal.stands) {
+    if (terminal.kind === "CANCELLED") {
+      return {
+        kind: "blocked",
+        reason: "terminal_cancelled",
+        detail:
+          `task ${taskId} was cancelled at seq ${terminal.seq} (it provably never ran); ` +
+          `it is terminated and will never be executed`,
+      };
+    }
+
+    if (terminal.kind === "CLOSED_WITHOUT_RESEND") {
+      return {
+        kind: "blocked",
+        reason: "terminal_closed",
+        detail:
+          `task ${taskId} was closed without a resend at seq ${terminal.seq}; ` +
+          `an operator decided it is never sent again`,
+      };
+    }
   }
 
   /*
@@ -103,8 +148,15 @@ export function decideDispatch(
    * Anything that proves WorkBuddy actually ran the task freezes scheduling.
    * "It was cancelled" is not evidence that nothing happened: the turn may
    * have written files before it was stopped.
+   *
+   * The proof itself is the canonical policy's, not a list written out here:
+   * `hasProvenSend` is the same answer the reconciler gives, so the dispatch
+   * gate and the report can never disagree about whether a task reached
+   * WorkBuddy.
    */
-  if (has(history, "RUNNING_CONFIRMED")) {
+  const provenSend = hasProvenSend(history.map((item) => item.event));
+
+  if (provenSend && has(history, "RUNNING_CONFIRMED")) {
     return {
       kind: "blocked",
       reason: "already_running",
@@ -112,7 +164,7 @@ export function decideDispatch(
     };
   }
 
-  if (has(history, "SEND_CONFIRMED")) {
+  if (provenSend && has(history, "SEND_CONFIRMED")) {
     return {
       kind: "blocked",
       reason: "send_confirmed",
