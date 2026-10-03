@@ -67,6 +67,10 @@ export type StartTaskOutcome =
   /**
    * Nothing reached WorkBuddy and nothing owns the task: the caller must put
    * the queue entry back exactly as it was.
+   *
+   * Also the answer when a task that was already dequeued meets a relay that
+   * has stopped being schedulable - the caller owns it, so it goes back rather
+   * than being copied under a new id.
    */
   | { kind: "pre_send_rejected"; reason: string };
 
@@ -156,6 +160,23 @@ export class DispatchPipeline {
    * that no path between "no model" and "WorkBuddy answered" can slip a
    * requeue in.
    *
+   * TWO PHASES, AND THE ORDER BETWEEN THEM IS THE FIX.
+   *
+   *   A. source acceptance   publish -> identity/source decision -> accepted
+   *   B. scheduling          paused / busy / routing / dispatch
+   *
+   * Source acceptance has to come first, because the strongest evidence a task
+   * can have is the moment it arrives: the relay is holding the real GPT
+   * assistant message that carried it. "Paused" and "another task is running"
+   * answer WHEN to run it, never WHERE IT CAME FROM - and a task that is
+   * queued first and asked about its origin minutes later has lost the only
+   * evidence it ever had, because ChatGPT unmounts old bubbles. That is how
+   * `relay-production-smoke-v0473i-003` ended up queued with a `TASK_PUBLISHED`
+   * and no `TASK_ACCEPTED`: nothing could ever prove it again.
+   *
+   * So acceptance is written before the scheduling gate, and a queued task
+   * carries its attestation into the queue with it.
+   *
    * The returned outcome is not a status report, it is an ownership handover:
    * every path that refuses to send before WorkBuddy has seen anything says so
    * explicitly, so the caller can keep holding a task nothing else took.
@@ -163,46 +184,31 @@ export class DispatchPipeline {
   async startTask(
     text: string,
     sourceFingerprint: string,
-    options: { observedOnGptPage?: boolean } = {},
+    options: { observedOnGptPage?: boolean; fromQueue?: boolean } = {},
   ): Promise<StartTaskOutcome> {
     const { store, audit, router } = this.deps;
 
     this.deps.noteActivity();
     console.log("[Relay] startWorkBuddyTask BEGIN");
 
-    const snapshot = store.snapshot();
-
     console.log("[Relay] snapshot OK");
 
     const taskId = ensureTaskId(text, makeId("task"));
     const fingerprint = taskFingerprint(text);
 
-    if (snapshot.paused) {
-      await this.recordEnqueued({
-        taskId,
-        taskFingerprint: fingerprint,
-        reason: "relay_paused",
-      });
-      await store.enqueue({
-        kind: "gpt_task",
-        id: makeId("pending-gpt"),
-        text,
-        fingerprint: sourceFingerprint,
-        createdAt: isoNow(),
-      });
-      return { kind: "queued", reason: "relay_paused" };
-    }
-
     /*
+     * PHASE A - source acceptance.
+     *
      * Identity first, WorkBuddy second. From here the ledger decides whether
      * this task may be sent, so a task that already ran - or that contradicts
      * an earlier envelope of the same name - stops here instead of going out
-     * a second time.
+     * a second time. Nothing about scheduling has been consulted yet, and
+     * none of it is allowed to change the answer.
      */
-    const plan = await this.deps.publishTask({
+    const plan = await this.acceptObservedTask({
       taskId,
-      fingerprint,
-      messageFingerprint: sourceFingerprint,
+      taskFingerprint: fingerprint,
+      sourceFingerprint,
       observedOnGptPage: options.observedOnGptPage === true,
     });
 
@@ -214,17 +220,47 @@ export class DispatchPipeline {
     if (!plan) return { kind: "pre_send_rejected", reason: "dispatch_not_allowed" };
 
     /*
-     * Accepted for a turn. Written before anything else can decide against
-     * sending, so the ledger always shows whether the relay meant to run this
-     * task - a later "enqueued" then says why it did not run now, and a
-     * "DISPATCH_STARTED" says it did.
+     * PHASE B - scheduling.
+     *
+     * Everything below decides WHEN, never WHAT. The task is already
+     * attested, so queueing it now costs nothing: the queue entry inherits a
+     * chain that will still prove it after a restart and after the GPT page
+     * has let go of the message.
      */
-    if (this.deps.reconciliation) {
-      await this.deps.reconciliation.recordTaskAccepted({
+    const scheduling = store.snapshot();
+
+    if (scheduling.paused) {
+      if (options.fromQueue === true) {
+        /*
+         * The caller already took this off the queue, so it owns the entry:
+         * queueing a second copy here would change its id and leave two.
+         */
+        return { kind: "pre_send_rejected", reason: "relay_paused" };
+      }
+
+      await this.queueAcceptedTask({
         taskId,
         taskFingerprint: fingerprint,
-        messageFingerprint: sourceFingerprint,
+        text,
+        sourceFingerprint,
+        reason: "relay_paused",
       });
+      return { kind: "queued", reason: "relay_paused" };
+    }
+
+    if (scheduling.currentTask) {
+      if (options.fromQueue === true) {
+        return { kind: "pre_send_rejected", reason: "another_task_active" };
+      }
+
+      await this.queueAcceptedTask({
+        taskId,
+        taskFingerprint: fingerprint,
+        text,
+        sourceFingerprint,
+        reason: "another_task_active",
+      });
+      return { kind: "queued", reason: "another_task_active" };
     }
 
     /*
@@ -1064,6 +1100,103 @@ export class DispatchPipeline {
     return typeof configured === "number" && configured > 0
       ? configured
       : 3_600_000;
+  }
+
+  /**
+   * PHASE A - accept a task's source and identity, and attest it durably.
+   *
+   * This is the whole of "where did this task come from", and it is asked at
+   * the one moment the answer exists. Nothing here knows whether the relay is
+   * paused, busy or idle, because none of those change what the answer is.
+   *
+   * Returns null when the ledger refuses: an identity conflict, or a task
+   * whose source cannot be established. Either way nothing has been sent and
+   * nothing has been attested, so the caller is free to walk away - a
+   * contradictory task is not one the relay may keep and retry.
+   */
+  private async acceptObservedTask(input: {
+    taskId: string;
+    taskFingerprint: string;
+    sourceFingerprint: string;
+    observedOnGptPage: boolean;
+  }): Promise<{ dispatchId: string; attempt: number } | null> {
+    const plan = await this.deps.publishTask({
+      taskId: input.taskId,
+      fingerprint: input.taskFingerprint,
+      messageFingerprint: input.sourceFingerprint,
+      observedOnGptPage: input.observedOnGptPage,
+    });
+
+    if (!plan) return null;
+
+    if (this.deps.reconciliation) {
+      /*
+       * TASK_ACCEPTED is a statement about PROVENANCE, not about EXECUTION:
+       * the relay verified this GPT task's identity and source, and the row is
+       * the durable attestation a later retry - or a later process - can be
+       * checked against. Execution still begins at DISPATCH_STARTED, so
+       * `accepted -> enqueued` is a complete and legal chain, and it is the
+       * chain a paused relay now leaves behind.
+       */
+      await this.deps.reconciliation.recordTaskAccepted({
+        taskId: input.taskId,
+        taskFingerprint: input.taskFingerprint,
+        messageFingerprint: input.sourceFingerprint,
+      });
+    }
+
+    return plan;
+  }
+
+  /**
+   * PHASE B - hand an already-attested task to the queue.
+   *
+   * The enqueue is written after the acceptance on purpose, so the ledger
+   * reads `TASK_ACCEPTED -> TASK_ENQUEUED` and reconciliation can see a task
+   * that is waiting rather than a task that vanished.
+   *
+   * A task already on the queue is not queued twice: an extension reconnect
+   * can deliver the same assistant message again, and two entries for one
+   * message would be two owners of one task.
+   */
+  private async queueAcceptedTask(input: {
+    taskId: string;
+    taskFingerprint: string;
+    text: string;
+    sourceFingerprint: string;
+    reason: string;
+  }): Promise<void> {
+    const { store } = this.deps;
+
+    await this.recordEnqueued({
+      taskId: input.taskId,
+      taskFingerprint: input.taskFingerprint,
+      reason: input.reason,
+    });
+
+    const alreadyQueued = store
+      .snapshot()
+      .pending.some((item) => item.kind === "gpt_task" && item.text === input.text);
+
+    if (alreadyQueued) {
+      console.log(
+        `[relay] task ${input.taskId} is already on the queue (${input.reason}); ` +
+          `not queued a second time`,
+      );
+      return;
+    }
+
+    await store.enqueue({
+      kind: "gpt_task",
+      id: makeId("pending-gpt"),
+      text: input.text,
+      fingerprint: input.sourceFingerprint,
+      createdAt: isoNow(),
+      taskId: input.taskId,
+      reason: input.reason,
+    });
+
+    console.log(`[relay] GPT task accepted and queued (${input.reason}): ${input.taskId}`);
   }
 
   /**

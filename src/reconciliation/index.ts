@@ -118,7 +118,20 @@ export class ReconciliationService {
     return { status: "ok", taskId: input.taskId, fingerprint: input.taskFingerprint };
   }
 
-  /** A task accepted for a turn: it is going to be sent, not just queued. */
+  /**
+   * A task whose SOURCE the relay has verified and attested.
+   *
+   * This is a statement about provenance, not about execution. It means: the
+   * relay checked this task's identity and the GPT message behind it, and the
+   * row is the durable proof a later retry - or a later process - is checked
+   * against when the page no longer carries the message.
+   *
+   * Execution begins at DISPATCH_STARTED. So `TASK_ACCEPTED -> TASK_ENQUEUED`
+   * is a complete, legal chain: the task is proven and waiting, and that is
+   * exactly what a relay that was paused or busy at intake time leaves behind.
+   * Reading this row as "WorkBuddy already started running it" is the mistake
+   * that made a paused intake look like an executed dispatch.
+   */
   async recordTaskAccepted(input: {
     taskId: string;
     taskFingerprint: string;

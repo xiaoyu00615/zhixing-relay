@@ -977,40 +977,36 @@ export class ZhixingRelay {
       snapshot = this.store.snapshot();
     }
 
-    if (snapshot.paused) {
-      await this.store.enqueue({
-        kind: "gpt_task",
-        id: makeId("pending-gpt"),
-        text: task,
-        fingerprint: message.fingerprint,
-        createdAt: isoNow(),
-      });
-      console.log("[relay] GPT task queued because relay is paused");
-      return;
-    }
-
-    if (snapshot.currentTask) {
-      await this.store.enqueue({
-        kind: "gpt_task",
-        id: makeId("pending-gpt"),
-        text: task,
-        fingerprint: message.fingerprint,
-        createdAt: isoNow(),
-      });
-      console.log("[relay] GPT task queued because another task is active");
-      return;
-    }
-
     /*
-     * The message arrived from the pinned ChatGPT page a moment ago, so it is
-     * the live proof of itself: assistant source, envelope, task id, message
-     * fingerprint. Naming that here is what lets the first acceptance write a
-     * durable attestation, which is the only reason a later retry can run
-     * after the page has unmounted the bubble.
+     * PAUSED AND BUSY ARE NOT ANSWERS TO "WHERE DID THIS COME FROM".
+     *
+     * They used to be handled here, before the pipeline ever ran, by putting
+     * the task straight on the queue. That skipped the acceptance entirely:
+     * no TASK_ACCEPTED was ever written, so the entry carried no source
+     * attestation into the queue - and a flush minutes later had nothing left
+     * to prove it with, because by then the GPT page had let go of the
+     * message. The task was unsendable for ever. That is
+     * `relay-production-smoke-v0473i-003`.
+     *
+     * So the scheduling gate moved into the pipeline, AFTER acceptance, and
+     * every observed GPT task is attested at the moment it is observed.
      */
-    await this.dispatch.startTask(task, message.fingerprint, {
+    const outcome = await this.dispatch.startTask(task, message.fingerprint, {
       observedOnGptPage: true,
     });
+
+    /*
+     * A task refused at the door - an identity conflict, or a source that
+     * cannot be established - is not one the relay may hold. It was never
+     * dequeued, so there is no owner to restore: saying so loudly is the
+     * whole of it.
+     */
+    if (outcome.kind === "pre_send_rejected") {
+      console.error(
+        `[relay] observed GPT task was not accepted (${outcome.reason}); ` +
+          `nothing was queued and nothing was sent`,
+      );
+    }
   }
 
   /** A machine-readable reason for a reply that carried nothing to do. */
@@ -2341,7 +2337,14 @@ export class ZhixingRelay {
        * its own entry, so adding the original back would put the task on the
        * queue twice.
        */
-      const outcome = await this.dispatch.startTask(item.text, item.fingerprint);
+      /*
+       * `fromQueue`: the entry is already off the queue and this call stack is
+       * the only thing holding it, so a scheduling refusal must hand it back
+       * rather than let the pipeline queue a second copy under a new id.
+       */
+      const outcome = await this.dispatch.startTask(item.text, item.fingerprint, {
+        fromQueue: true,
+      });
 
       if (outcome.kind === "pre_send_rejected") {
         await this.retainPendingTask(item, outcome.reason);
